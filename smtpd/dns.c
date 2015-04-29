@@ -118,6 +118,13 @@ struct dns_rr {
 			struct in6_addr	addr6;
 		} in_aaaa;
 		struct {
+			uint8_t		usage;
+			uint8_t		selector;
+			uint8_t		match;
+			uint16_t	rdlen;
+			const void     *rdata;
+		} in_tlsa;
+		struct {
 			uint16_t	 rdlen;
 			const void	*rdata;
 		} other;
@@ -699,6 +706,18 @@ unpack_rr(struct unpack *p, struct dns_rr *rr)
 			goto other;
 		unpack_in6addr(p, &rr->rr.in_aaaa.addr6);
 		break;
+
+	case 52:
+		if (rr->rr_class != C_IN)
+			goto other;
+		unpack_data(p, &rr->rr.in_tlsa.usage, sizeof(rr->rr.in_tlsa.usage));
+		unpack_data(p, &rr->rr.in_tlsa.selector, sizeof(rr->rr.in_tlsa.selector));
+		unpack_data(p, &rr->rr.in_tlsa.match, sizeof(rr->rr.in_tlsa.match));
+		rr->rr.in_tlsa.rdata = p->buf + p->offset;
+		rr->rr.in_tlsa.rdlen = rdlen - (p->offset - save_offset);
+		p->offset += rr->rr.in_tlsa.rdlen;
+		break;
+		
 	default:
 	other:
 		rr->rr.other.rdata = p->buf + p->offset;
@@ -714,4 +733,49 @@ unpack_rr(struct unpack *p, struct dns_rr *rr)
 		p->err = "bad dlen";
 
 	return (p->err) ? (-1) : (0);
+}
+
+static void
+dns_dispatch_tlsa(struct asr_result *ar, void *arg)
+{
+	struct unpack		 pack;
+	struct dns_header	 h;
+	struct dns_query	 q;
+	struct dns_rr		 rr;
+	int			 i;
+	int			 found;
+	
+	unpack_init(&pack, ar->ar_data, ar->ar_datalen);
+	unpack_header(&pack, &h);
+	unpack_query(&pack, &q);
+
+	found = 0;
+	for (; h.ancount; h.ancount--) {
+		unpack_rr(&pack, &rr);
+		if (rr.rr_type != 52)
+			continue;
+		log_debug("UNPACKED RR");
+		log_debug("USAGE: %d", rr.rr.in_tlsa.usage);
+		log_debug("SELECTOR: %d", rr.rr.in_tlsa.selector);
+		log_debug("MATCH: %d", rr.rr.in_tlsa.match);
+		log_debug("DATA:");
+		for (i = 0; i < rr.rr.in_tlsa.rdlen; ++i) {
+			printf("%02x", ((unsigned char *)rr.rr.in_tlsa.rdata)[i]);
+		}
+		printf("\n");
+	}
+	free(ar->ar_data);
+
+	/* fallback to host if no MX is found. */
+	log_debug("found: %d", found);
+}
+
+int
+dns_tlsa_lookup(const char *key)
+{
+	struct asr_query	*as;
+	
+	log_debug("key: %s", key);
+	as = res_query_async(key, C_IN, 52, NULL);
+	event_asr_run(as, dns_dispatch_tlsa, NULL);
 }

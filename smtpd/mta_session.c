@@ -1585,6 +1585,13 @@ mta_verify_certificate(struct mta_session *s)
 	    >= sizeof req_ca_vrfy.pkiname)
 		return 0;
 
+	if (s->route->dst->ptrname)
+		(void)strlcpy(req_ca_vrfy.ptrname, s->route->dst->ptrname, sizeof req_ca_vrfy.ptrname);
+	req_ca_vrfy.port = s->relay->port;
+
+	log_debug("########### %d", s->relay->port);
+	
+	
 	req_ca_vrfy.reqid = s->id;
 	req_ca_vrfy.cert_len = i2d_X509(x, &req_ca_vrfy.cert);
 	if (xchain)

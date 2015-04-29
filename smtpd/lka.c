@@ -57,6 +57,8 @@ static int lka_addrname(const char *, const struct sockaddr *,
     struct addrname *);
 static int lka_mailaddrmap(const char *, const char *, const struct mailaddr *);
 static int lka_X509_verify(struct ca_vrfy_req_msg *, const char *, const char *);
+static int lka_dane_verify(X509 *, const char *, uint16_t);
+int dns_tlsa_lookup(const char *);
 
 static void
 lka_imsg(struct mproc *p, struct imsg *imsg)
@@ -307,6 +309,9 @@ lka_imsg(struct mproc *p, struct imsg *imsg)
 			resp_ca_vrfy.reqid = req_ca_vrfy_mta->reqid;
 			pki = dict_get(env->sc_pki_dict, req_ca_vrfy_mta->pkiname);
 
+			
+			lka_dane_verify(NULL, req_ca_vrfy_mta->ptrname, req_ca_vrfy_mta->port);
+			
 			cafile = CA_FILE;
 			if (pki && pki->pki_ca_file)
 				cafile = pki->pki_ca_file;
@@ -751,4 +756,28 @@ end:
 		sk_X509_pop_free(x509_chain, X509_free);
 
 	return ret;
+}
+
+static int
+lka_dane_verify(struct ca_vrfy_req_msg *vrfy, const char *dname, uint16_t port)
+{
+	X509    *x509;
+	const unsigned char    	*d2i;
+	char	buffer[1024];
+
+	x509 = NULL;
+	d2i = vrfy->cert;
+	if (d2i_X509(&x509, &d2i, vrfy->cert_len) == NULL) {
+		x509 = NULL;
+		goto end;
+	}
+	
+	port = 25;
+	(void)snprintf(buffer, sizeof buffer, "_%d._tcp.%s.", port, dname);
+	dns_tlsa_lookup(buffer, x509);
+
+end:	
+	if (x509)
+		X509_free(x509);
+	return 1;
 }

@@ -1075,6 +1075,8 @@ struct ca_cert_resp_msg {
 struct ca_vrfy_req_msg {
 	uint64_t		reqid;
 	char			pkiname[HOST_NAME_MAX+1];
+	char			ptrname[HOST_NAME_MAX+1];
+	uint16_t		port;
 	unsigned char  	       *cert;
 	off_t			cert_len;
 	size_t			n_chain;
