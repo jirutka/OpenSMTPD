@@ -754,15 +754,21 @@ dns_dispatch_tlsa(struct asr_result *ar, void *arg)
 		unpack_rr(&pack, &rr);
 		if (rr.rr_type != 52)
 			continue;
-		log_debug("UNPACKED RR");
-		log_debug("USAGE: %d", rr.rr.in_tlsa.usage);
-		log_debug("SELECTOR: %d", rr.rr.in_tlsa.selector);
-		log_debug("MATCH: %d", rr.rr.in_tlsa.match);
-		log_debug("DATA:");
-		for (i = 0; i < rr.rr.in_tlsa.rdlen; ++i) {
-			printf("%02x", ((unsigned char *)rr.rr.in_tlsa.rdata)[i]);
+		{
+			char	*buffer = malloc(rr.rr.in_tlsa.rdlen * 2 + 1);
+			for (i = 0; i < rr.rr.in_tlsa.rdlen; ++i)
+				sprintf(buffer + i*2, "%02x", ((unsigned char *)rr.rr.in_tlsa.rdata)[i]);
+
+			log_debug("TLSA"
+			    " usage=%d,"
+			    " selector=%d,"
+			    " match=%d, data=%s",
+			    rr.rr.in_tlsa.usage,
+			    rr.rr.in_tlsa.selector,
+			    rr.rr.in_tlsa.match,
+			    buffer);
 		}
-		printf("\n");
+
 	}
 	free(ar->ar_data);
 
@@ -775,7 +781,6 @@ dns_tlsa_lookup(const char *key)
 {
 	struct asr_query	*as;
 	
-	log_debug("key: %s", key);
 	as = res_query_async(key, C_IN, 52, NULL);
 	event_asr_run(as, dns_dispatch_tlsa, NULL);
 }
