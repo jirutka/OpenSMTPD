@@ -1162,7 +1162,7 @@ struct delivery_backend *delivery_backend_lookup(enum action_type);
 
 /* dns.c */
 void dns_imsg(struct mproc *, struct imsg *);
-
+void dns_lookup_tlsa(const char *);
 
 /* enqueue.c */
 int		 enqueue(int, char **);
@@ -1216,6 +1216,10 @@ void lka_session_forward_reply(struct forward_req *, int);
 /* log.c */
 void vlog(int, const char *, va_list);
 void logit(int, const char *, ...) __attribute__((format (printf, 2, 3)));
+
+/* lookup_tls.c */
+void lookup_tls(uint64_t);
+
 
 /* mda.c */
 void mda_postfork(void);

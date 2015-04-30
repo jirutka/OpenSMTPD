@@ -57,8 +57,9 @@ static int lka_addrname(const char *, const struct sockaddr *,
     struct addrname *);
 static int lka_mailaddrmap(const char *, const char *, const struct mailaddr *);
 static int lka_X509_verify(struct ca_vrfy_req_msg *, const char *, const char *);
-static int lka_dane_verify(struct ca_vrfy_req_msg *, const char *, uint16_t);
-int dns_tlsa_lookup(const char *);
+
+static void lka_cert_verify(enum imsg_type, struct ca_vrfy_req_msg *);
+static void lka_cert_resume(enum imsg_type, void *);
 
 static void
 lka_imsg(struct mproc *p, struct imsg *imsg)
@@ -70,7 +71,6 @@ lka_imsg(struct mproc *p, struct imsg *imsg)
 	static struct ca_vrfy_req_msg	*req_ca_vrfy_smtp = NULL;
 	static struct ca_vrfy_req_msg	*req_ca_vrfy_mta = NULL;
 	struct ca_vrfy_req_msg		*req_ca_vrfy_chain;
-	struct ca_vrfy_resp_msg		resp_ca_vrfy;
 	struct ca_cert_req_msg		*req_ca_cert;
 	struct ca_cert_resp_msg		 resp_ca_cert;
 	struct sockaddr_storage	 ss;
@@ -83,9 +83,7 @@ lka_imsg(struct mproc *p, struct imsg *imsg)
 	char			 buf[LINE_MAX];
 	const char		*tablename, *username, *password, *label;
 	uint64_t		 reqid;
-	size_t			 i;
 	int			 v;
-	const char	        *cafile = NULL;
 
 	if (imsg->hdr.type == IMSG_MTA_DNS_HOST ||
 	    imsg->hdr.type == IMSG_MTA_DNS_PTR ||
@@ -186,25 +184,7 @@ lka_imsg(struct mproc *p, struct imsg *imsg)
 			if (req_ca_vrfy_smtp == NULL)
 				fatalx("lka:ca_vrfy: verify without a certificate");
 
-			resp_ca_vrfy.reqid = req_ca_vrfy_smtp->reqid;
-			pki = dict_xget(env->sc_pki_dict, req_ca_vrfy_smtp->pkiname);
-			cafile = CA_FILE;
-			if (pki->pki_ca_file)
-				cafile = pki->pki_ca_file;
-			if (! lka_X509_verify(req_ca_vrfy_smtp, cafile, NULL))
-				resp_ca_vrfy.status = CA_FAIL;
-			else
-				resp_ca_vrfy.status = CA_OK;
-
-			m_compose(p, IMSG_SMTP_SSL_VERIFY, 0, 0, -1, &resp_ca_vrfy,
-			    sizeof resp_ca_vrfy);
-
-			for (i = 0; i < req_ca_vrfy_smtp->n_chain; ++i)
-				free(req_ca_vrfy_smtp->chain_cert[i]);
-			free(req_ca_vrfy_smtp->chain_cert);
-			free(req_ca_vrfy_smtp->chain_cert_len);
-			free(req_ca_vrfy_smtp->cert);
-			free(req_ca_vrfy_smtp);
+			lka_cert_verify(imsg->hdr.type, req_ca_vrfy_smtp);
 			return;
 
 		case IMSG_SMTP_AUTHENTICATE:
@@ -306,27 +286,7 @@ lka_imsg(struct mproc *p, struct imsg *imsg)
 			if (req_ca_vrfy_mta == NULL)
 				fatalx("lka:ca_vrfy: verify without a certificate");
 
-			resp_ca_vrfy.reqid = req_ca_vrfy_mta->reqid;
-			pki = dict_get(env->sc_pki_dict, req_ca_vrfy_mta->pkiname);
-
-			lka_dane_verify(req_ca_vrfy_mta, req_ca_vrfy_mta->ptrname, req_ca_vrfy_mta->port);
-			cafile = CA_FILE;
-			if (pki && pki->pki_ca_file)
-				cafile = pki->pki_ca_file;
-			if (! lka_X509_verify(req_ca_vrfy_mta, cafile, NULL))
-				resp_ca_vrfy.status = CA_FAIL;
-			else
-				resp_ca_vrfy.status = CA_OK;
-
-			m_compose(p, IMSG_MTA_SSL_VERIFY, 0, 0, -1, &resp_ca_vrfy,
-			    sizeof resp_ca_vrfy);
-
-			for (i = 0; i < req_ca_vrfy_mta->n_chain; ++i)
-				free(req_ca_vrfy_mta->chain_cert[i]);
-			free(req_ca_vrfy_mta->chain_cert);
-			free(req_ca_vrfy_mta->chain_cert_len);
-			free(req_ca_vrfy_mta->cert);
-			free(req_ca_vrfy_mta);
+			lka_cert_verify(imsg->hdr.type, req_ca_vrfy_mta);
 			return;
 
 		case IMSG_MTA_LOOKUP_CREDENTIALS:
@@ -756,26 +716,38 @@ end:
 	return ret;
 }
 
-static int
-lka_dane_verify(struct ca_vrfy_req_msg *vrfy, const char *dname, uint16_t port)
+static void
+lka_cert_verify(enum imsg_type type, struct ca_vrfy_req_msg *req)
 {
-	X509    *x509;
-	const unsigned char    	*d2i;
-	char	buffer[1024];
+	lka_cert_resume(type, req);
+}
 
-	x509 = NULL;
-	d2i = vrfy->cert;
-	if (d2i_X509(&x509, &d2i, vrfy->cert_len) == NULL) {
-		x509 = NULL;
-		goto end;
-	}
-	
-	(void)snprintf(buffer, sizeof buffer, "_%d._tcp.%s.", port, dname);
-	log_debug("debug: dane: looking up IN TLSA %s record", buffer);
-	dns_tlsa_lookup(buffer);
+static void
+lka_cert_resume(enum imsg_type type, void *args)
+{
+	struct ca_vrfy_req_msg *req = args;
+	struct ca_vrfy_resp_msg	resp;
+	struct pki	       *pki;
+	const char	       *cafile;
+	size_t			i;
 
-end:	
-	if (x509)
-		X509_free(x509);
-	return 1;
+	resp.reqid = req->reqid;
+	pki = dict_get(env->sc_pki_dict, req->pkiname);
+	cafile = CA_FILE;
+	if (pki && pki->pki_ca_file)
+		cafile = pki->pki_ca_file;
+
+	if (! lka_X509_verify(req, cafile, NULL))
+		resp.status = CA_FAIL;
+	else
+		resp.status = CA_OK;
+	m_compose(p_pony, type, 0, 0, -1, &resp,
+	    sizeof resp);
+
+	for (i = 0; i < req->n_chain; ++i)
+		free(req->chain_cert[i]);
+	free(req->chain_cert);
+	free(req->chain_cert_len);
+	free(req->cert);
+	free(req);
 }

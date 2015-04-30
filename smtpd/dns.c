@@ -742,42 +742,21 @@ dns_dispatch_tlsa(struct asr_result *ar, void *arg)
 	struct dns_header	 h;
 	struct dns_query	 q;
 	struct dns_rr		 rr;
-	int			 i;
-	int			 found;
 	
 	unpack_init(&pack, ar->ar_data, ar->ar_datalen);
 	unpack_header(&pack, &h);
 	unpack_query(&pack, &q);
 
-	found = 0;
 	for (; h.ancount; h.ancount--) {
 		unpack_rr(&pack, &rr);
 		if (rr.rr_type != 52)
 			continue;
-		{
-			char	*buffer = malloc(rr.rr.in_tlsa.rdlen * 2 + 1);
-			for (i = 0; i < rr.rr.in_tlsa.rdlen; ++i)
-				sprintf(buffer + i*2, "%02x", ((unsigned char *)rr.rr.in_tlsa.rdata)[i]);
-
-			log_debug("TLSA"
-			    " usage=%d,"
-			    " selector=%d,"
-			    " match=%d, data=%s",
-			    rr.rr.in_tlsa.usage,
-			    rr.rr.in_tlsa.selector,
-			    rr.rr.in_tlsa.match,
-			    buffer);
-		}
-
 	}
 	free(ar->ar_data);
-
-	/* fallback to host if no MX is found. */
-	log_debug("found: %d", found);
 }
 
-int
-dns_tlsa_lookup(const char *key)
+void
+dns_lookup_tlsa(const char *key)
 {
 	struct asr_query	*as;
 	
