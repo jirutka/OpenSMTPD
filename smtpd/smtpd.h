@@ -1099,6 +1099,14 @@ struct msg_walkinfo {
 	int		 done;
 };
 
+struct tlsa {
+	uint8_t		 usage;
+	uint8_t		 selector;
+	uint8_t		 match;
+	unsigned char	*data;
+	size_t		 dlen;
+};
+
 /* aliases.c */
 int aliases_get(struct expand *, const char *);
 int aliases_virtual_check(struct table *, const struct mailaddr *);
@@ -1162,7 +1170,8 @@ struct delivery_backend *delivery_backend_lookup(enum action_type);
 
 /* dns.c */
 void dns_imsg(struct mproc *, struct imsg *);
-void dns_lookup_tlsa(const char *);
+void dns_lookup_tlsa(const char *, void (*)(struct tlsa *, void *), void *);
+
 
 /* enqueue.c */
 int		 enqueue(int, char **);

@@ -59,7 +59,10 @@ static int lka_mailaddrmap(const char *, const char *, const struct mailaddr *);
 static int lka_X509_verify(struct ca_vrfy_req_msg *, const char *, const char *);
 
 static void lka_cert_verify(enum imsg_type, struct ca_vrfy_req_msg *);
-static void lka_cert_resume(enum imsg_type, void *);
+static void lka_cert_resume(enum imsg_type, struct ca_vrfy_req_msg *);
+static void lka_dane_resume(struct tlsa *, void *);
+static int lka_dane_verify(struct tlsa *, struct ca_vrfy_req_msg *);
+
 
 static void
 lka_imsg(struct mproc *p, struct imsg *imsg)
@@ -716,16 +719,127 @@ end:
 	return ret;
 }
 
+
+/**/
 static void
 lka_cert_verify(enum imsg_type type, struct ca_vrfy_req_msg *req)
 {
-	lka_cert_resume(type, req);
+	char	buffer[1024];
+
+	if (type == IMSG_SMTP_SSL_VERIFY) {
+		lka_cert_resume(type, req);
+		return;
+	};
+	
+	(void)snprintf(buffer, sizeof buffer, "_%d._tcp.%s.", req->port, req->ptrname);
+	dns_lookup_tlsa(buffer, lka_dane_resume, req);
 }
 
 static void
-lka_cert_resume(enum imsg_type type, void *args)
+lka_dane_resume(struct tlsa *tlsa, void *foo)
 {
-	struct ca_vrfy_req_msg *req = args;
+	struct ca_vrfy_req_msg *req = foo;
+
+	if (tlsa == NULL) {
+		log_debug("DANE: NO TLSA RECORD FOR %s", req->ptrname);
+	}
+	else {
+		if (! lka_dane_verify(tlsa, req))
+			log_debug("DANE: VERIFICATION FOR %s FAILED.", req->ptrname);
+		else
+			log_debug("DANE: VERIFICATION FOR %s SUCCEEDED.", req->ptrname);
+	}
+	
+	
+	lka_cert_resume(IMSG_MTA_SSL_VERIFY, req);
+}
+
+static int
+lka_dane_verify(struct tlsa *tlsa, struct ca_vrfy_req_msg *req)
+{
+	unsigned char	       *data;
+	size_t			dlen = req->cert_len;
+
+	log_debug("TLSA FOR %s !", req->ptrname);
+
+	/* First, check usage and understand how it works */
+	/*goto fail;*/
+
+	/* Then, use selector to determine what to match against tlsa->data */
+	switch (tlsa->selector) {
+	case 0:
+		/* DER-encoded cert */
+		data = req->cert;
+		break;
+	case 1:
+		/*  DER-encoded subjectPublickKeyInfo */
+		data = NULL; /* not yet */
+		goto fail;
+	default:
+		/* not valid */
+		goto fail;
+	}
+	
+
+	switch (tlsa->match) {
+	case 0: {
+		/* binary match */
+		size_t		i, j;
+		unsigned char	conv[] = "0123456789abcdef";
+		
+		if (tlsa->dlen != dlen * 2)
+			goto fail;		
+
+		for (i = j = 0; i < dlen; ++i, j+=2) {
+			if (conv[data[i] / 16] != tlsa->data[j])
+				goto fail;
+			if (conv[data[i] % 16] != tlsa->data[j+1])
+				goto fail;
+		}
+		break;
+	}
+	case 1: {
+		/* SHA-256 match */
+		SHA256_CTX	sha256;
+		unsigned char	hash[SHA256_DIGEST_LENGTH];
+
+		if (tlsa->dlen != SHA256_DIGEST_LENGTH)
+			goto fail;		
+		SHA256_Init(&sha256);
+		SHA256_Update(&sha256, data, dlen);
+		SHA256_Final(hash, &sha256);
+		if (memcmp(hash, tlsa->data, tlsa->dlen) != 0)
+			goto fail;
+		break;
+	}
+	case 2: {
+		/* SHA-512 match */
+		SHA512_CTX	sha512;
+		unsigned char	hash[SHA512_DIGEST_LENGTH];
+
+		if (tlsa->dlen != SHA512_DIGEST_LENGTH)
+			goto fail;
+		SHA512_Init(&sha512);
+		SHA512_Update(&sha512, data, dlen);
+		SHA512_Final(hash, &sha512);
+		if (memcmp(hash, tlsa->data, tlsa->dlen) != 0)
+			goto fail;
+		break;
+	}
+	default:
+		/* not valid */
+		goto fail;
+	}
+
+	return 1;
+
+fail:	
+	return 0;
+}
+
+static void
+lka_cert_resume(enum imsg_type type, struct ca_vrfy_req_msg *req)
+{
 	struct ca_vrfy_resp_msg	resp;
 	struct pki	       *pki;
 	const char	       *cafile;

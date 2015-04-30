@@ -55,6 +55,12 @@ struct dns_session {
 	int			 refcount;
 };
 
+/* this is temporary, we really need to refactor both lka.c and dns.c */
+struct dane_session {
+	void (*fn)(void *, void *);
+	void *arg;
+};
+
 static void dns_lookup_host(struct dns_session *, const char *, int);
 static void dns_dispatch_host(struct asr_result *, void *);
 static void dns_dispatch_ptr(struct asr_result *, void *);
@@ -742,6 +748,9 @@ dns_dispatch_tlsa(struct asr_result *ar, void *arg)
 	struct dns_header	 h;
 	struct dns_query	 q;
 	struct dns_rr		 rr;
+	struct dane_session	*ds = arg;
+	struct tlsa		 tlsa;
+	struct tlsap		*tlsap = NULL;
 	
 	unpack_init(&pack, ar->ar_data, ar->ar_datalen);
 	unpack_header(&pack, &h);
@@ -751,15 +760,28 @@ dns_dispatch_tlsa(struct asr_result *ar, void *arg)
 		unpack_rr(&pack, &rr);
 		if (rr.rr_type != 52)
 			continue;
+		tlsa.usage    = rr.rr.in_tlsa.usage;
+		tlsa.selector = rr.rr.in_tlsa.selector;
+		tlsa.match    = rr.rr.in_tlsa.match;
+		tlsa.data     = rr.rr.in_tlsa.rdata;
+		tlsa.dlen     = rr.rr.in_tlsa.rdlen;
+		tlsap = &tlsa;
 	}
+
+	ds->fn(tlsap, ds->arg);
 	free(ar->ar_data);
+	free(ds);
 }
 
 void
-dns_lookup_tlsa(const char *key)
+dns_lookup_tlsa(const char *key, void (*fn)(struct tlsa *, void *), void *arg)
 {
 	struct asr_query	*as;
-	
+	struct dane_session	*ds;
+
+	ds = xcalloc(1, sizeof *ds, "dns_lookup_tlsa");
+	ds->fn  = fn;
+	ds->arg = arg;
 	as = res_query_async(key, C_IN, 52, NULL);
-	event_asr_run(as, dns_dispatch_tlsa, NULL);
+	event_asr_run(as, dns_dispatch_tlsa, ds);
 }
