@@ -65,6 +65,7 @@ void io_pause(struct io *, int);
 void io_resume(struct io *, int);
 void io_reload(struct io *);
 int io_connect(struct io *, const struct sockaddr *, const struct sockaddr *);
+int io_get_peer_port(struct io *);
 int io_start_tls(struct io *, void *);
 const char* io_strio(struct io *);
 const char* io_strevent(int);

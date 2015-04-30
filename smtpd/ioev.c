@@ -19,6 +19,8 @@
 #include <sys/queue.h>
 #include <sys/socket.h>
 
+#include <netinet/in.h>
+
 #include <err.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -654,6 +656,22 @@ io_dispatch_connect(int fd, short ev, void *humppa)
 	}
 
 	io_frame_leave(io);
+}
+
+int
+io_get_peer_port(struct io *io)
+{
+	struct sockaddr_storage	ss;
+	socklen_t		sl;
+
+	if (getpeername(io->sock, (struct sockaddr *)&ss, &sl) == -1)
+		return -1;
+
+	if (ss.ss_family == AF_INET)
+		return htons(((struct sockaddr_in *)&ss)->sin_port);
+	if (ss.ss_family == AF_INET6)
+		return htons(((struct sockaddr_in6 *)&ss)->sin6_port);
+	return -1;
 }
 
 #ifdef IO_SSL
