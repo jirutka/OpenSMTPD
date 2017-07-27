@@ -1,5 +1,5 @@
-/*	$OpenBSD: ioev.c,v 1.19 2014/07/08 07:59:31 sobrado Exp $	*/
-/*      
+/*	$OpenBSD: ioev.c,v 1.41 2017/05/17 14:00:06 deraadt Exp $	*/
+/*
  * Copyright (c) 2012 Eric Faurot <eric@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
@@ -23,6 +23,7 @@
 
 #include <err.h>
 #include <errno.h>
+#include <event.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <stdlib.h>
@@ -46,6 +47,28 @@ enum {
 	IO_STATE_UP,
 
 	IO_STATE_MAX,
+};
+
+#define IO_PAUSE_IN 		IO_IN
+#define IO_PAUSE_OUT		IO_OUT
+#define IO_READ			0x04
+#define IO_WRITE		0x08
+#define IO_RW			(IO_READ | IO_WRITE)
+#define IO_RESET		0x10  /* internal */
+#define IO_HELD			0x20  /* internal */
+
+struct io {
+	int		 sock;
+	void		*arg;
+	void		(*cb)(struct io*, int, void *);
+	struct iobuf	 iobuf;
+	size_t		 lowat;
+	int		 timeout;
+	int		 flags;
+	int		 state;
+	struct event	 ev;
+	void		*ssl;
+	const char	*error; /* only valid immediately on callback */
 };
 
 const char* io_strflags(int);
@@ -91,21 +114,16 @@ io_strio(struct io *io)
 #ifdef IO_SSL
 	if (io->ssl) {
 		(void)snprintf(ssl, sizeof ssl, " ssl=%s:%s:%d",
-		    SSL_get_cipher_version(io->ssl),
+		    SSL_get_version(io->ssl),
 		    SSL_get_cipher_name(io->ssl),
 		    SSL_get_cipher_bits(io->ssl, NULL));
 	}
 #endif
 
-	if (io->iobuf == NULL)
-		(void)snprintf(buf, sizeof buf,
-		    "<io:%p fd=%d to=%d fl=%s%s>",
-		    io, io->sock, io->timeout, io_strflags(io->flags), ssl);
-	else
-		(void)snprintf(buf, sizeof buf,
-		    "<io:%p fd=%d to=%d fl=%s%s ib=%zu ob=%zu>",
-		    io, io->sock, io->timeout, io_strflags(io->flags), ssl,
-		    io_pending(io), io_queued(io));
+	(void)snprintf(buf, sizeof buf,
+	    "<io:%p fd=%d to=%d fl=%s%s ib=%zu ob=%zu>",
+	    io, io->sock, io->timeout, io_strflags(io->flags), ssl,
+	    io_pending(io), io_queued(io));
 
 	return (buf);
 }
@@ -120,7 +138,6 @@ io_strevent(int evt)
 	switch (evt) {
 	CASE(IO_CONNECTED);
 	CASE(IO_TLSREADY);
-	CASE(IO_TLSVERIFIED);
 	CASE(IO_DATAIN);
 	CASE(IO_LOWAT);
 	CASE(IO_DISCONNECTED);
@@ -133,30 +150,25 @@ io_strevent(int evt)
 }
 
 void
-io_set_blocking(int fd, int blocking)
+io_set_nonblocking(int fd)
 {
 	int	flags;
 
-	if ((flags = fcntl(fd, F_GETFL, 0)) == -1)
+	if ((flags = fcntl(fd, F_GETFL)) == -1)
 		err(1, "io_set_blocking:fcntl(F_GETFL)");
 
-	if (blocking)
-		flags &= ~O_NONBLOCK;
-	else
-		flags |= O_NONBLOCK;
+	flags |= O_NONBLOCK;
 
-	if ((flags = fcntl(fd, F_SETFL, flags)) == -1)
+	if (fcntl(fd, F_SETFL, flags) == -1)
 		err(1, "io_set_blocking:fcntl(F_SETFL)");
 }
 
 void
-io_set_linger(int fd, int linger)
+io_set_nolinger(int fd)
 {
 	struct linger    l;
 
 	memset(&l, 0, sizeof(l));
-	l.l_onoff = linger ? 1 : 0;
-	l.l_linger = linger;
 	if (setsockopt(fd, SOL_SOCKET, SO_LINGER, &l, sizeof(l)) == -1)
 		err(1, "io_set_linger:setsockopt()");
 }
@@ -231,26 +243,29 @@ _io_init()
 	_io_debug = getenv("IO_DEBUG") != NULL;
 }
 
-void
-io_init(struct io *io, int sock, void *arg,
-	void(*cb)(struct io*, int), struct iobuf *iobuf)
+struct io *
+io_new(void)
 {
+	struct io *io;
+
 	_io_init();
 
-	memset(io, 0, sizeof *io);
+	if ((io = calloc(1, sizeof(*io))) == NULL)
+		return NULL;
 
-	io->sock = sock;
+	io->sock = -1;
 	io->timeout = -1;
-	io->arg = arg;
-	io->iobuf = iobuf;
-	io->cb = cb;
 
-	if (sock != -1)
-		io_reload(io);
+	if (iobuf_init(&io->iobuf, 0, 0) == -1) {
+		free(io);
+		return NULL;
+	}
+
+	return io;
 }
 
 void
-io_clear(struct io *io)
+io_free(struct io *io)
 {
 	io_debug("io_clear(%p)\n", io);
 
@@ -259,10 +274,8 @@ io_clear(struct io *io)
 		current = NULL;
 
 #ifdef IO_SSL
-	if (io->ssl) {
-		SSL_free(io->ssl);
-		io->ssl = NULL;
-	}
+	SSL_free(io->ssl);
+	io->ssl = NULL;
 #endif
 
 	if (event_initialized(&io->ev))
@@ -271,6 +284,9 @@ io_clear(struct io *io)
 		close(io->sock);
 		io->sock = -1;
 	}
+
+	iobuf_clear(&io->iobuf);
+	free(io);
 }
 
 void
@@ -294,6 +310,21 @@ io_release(struct io *io)
 	io->flags &= ~IO_HELD;
 	if (!(io->flags & IO_RESET))
 		io_reload(io);
+}
+
+void
+io_set_fd(struct io *io, int fd)
+{
+	io->sock = fd;
+	if (fd != -1)
+		io_reload(io);
+}
+
+void
+io_set_callback(struct io *io, void(*cb)(struct io *, int, void *), void *arg)
+{
+	io->cb = cb;
+	io->arg = arg;
 }
 
 void
@@ -362,6 +393,128 @@ io_set_write(struct io *io)
 	io_reload(io);
 }
 
+const char *
+io_error(struct io *io)
+{
+	return io->error;
+}
+
+void *
+io_ssl(struct io *io)
+{
+	return io->ssl;
+}
+
+int
+io_fileno(struct io *io)
+{
+	return io->sock;
+}
+
+int
+io_paused(struct io *io, int what)
+{
+	return (io->flags & (IO_PAUSE_IN | IO_PAUSE_OUT)) == what;
+}
+
+/*
+ * Buffered output functions
+ */
+
+int
+io_write(struct io *io, const void *buf, size_t len)
+{
+	int r;
+
+	r = iobuf_queue(&io->iobuf, buf, len);
+
+	io_reload(io);
+
+	return r;
+}
+
+int
+io_writev(struct io *io, const struct iovec *iov, int iovcount)
+{
+	int r;
+
+	r = iobuf_queuev(&io->iobuf, iov, iovcount);
+
+	io_reload(io);
+
+	return r;
+}
+
+int
+io_print(struct io *io, const char *s)
+{
+	return io_write(io, s, strlen(s));
+}
+
+int
+io_printf(struct io *io, const char *fmt, ...)
+{
+	va_list ap;
+	int r;
+
+	va_start(ap, fmt);
+	r = io_vprintf(io, fmt, ap);
+	va_end(ap);
+
+	return r;
+}
+
+int
+io_vprintf(struct io *io, const char *fmt, va_list ap)
+{
+
+	char *buf;
+	int len;
+
+	len = vasprintf(&buf, fmt, ap);
+	if (len == -1)
+		return -1;
+	len = io_write(io, buf, len);
+	free(buf);
+
+	return len;
+}
+
+size_t
+io_queued(struct io *io)
+{
+	return iobuf_queued(&io->iobuf);
+}
+
+/*
+ * Buffered input functions
+ */
+
+void *
+io_data(struct io *io)
+{
+	return iobuf_data(&io->iobuf);
+}
+
+size_t
+io_datalen(struct io *io)
+{
+	return iobuf_len(&io->iobuf);
+}
+
+char *
+io_getline(struct io *io, size_t *sz)
+{
+	return iobuf_getline(&io->iobuf, sz);
+}
+
+void
+io_drop(struct io *io, size_t sz)
+{
+	return iobuf_drop(&io->iobuf, sz);
+}
+
+
 #define IO_READING(io) (((io)->flags & IO_RW) != IO_WRITE)
 #define IO_WRITING(io) (((io)->flags & IO_RW) != IO_READ)
 
@@ -377,6 +530,8 @@ io_reload(struct io *io)
 	/* io will be reloaded at release time */
 	if (io->flags & IO_HELD)
 		return;
+
+	iobuf_normalize(&io->iobuf);
 
 #ifdef IO_SSL
 	if (io->ssl) {
@@ -435,13 +590,7 @@ io_reset(struct io *io, short events, void (*dispatch)(int, short, void*))
 size_t
 io_pending(struct io *io)
 {
-	return iobuf_len(io->iobuf);
-}
-
-size_t
-io_queued(struct io *io)
-{
-	return iobuf_queued(io->iobuf);
+	return iobuf_len(&io->iobuf);
 }
 
 const char*
@@ -546,7 +695,7 @@ io_dispatch(int fd, short ev, void *humppa)
 	}
 
 	if (ev & EV_WRITE && (w = io_queued(io))) {
-		if ((n = iobuf_write(io->iobuf, io->sock)) < 0) {
+		if ((n = iobuf_write(&io->iobuf, io->sock)) < 0) {
 			if (n == IOBUF_WANT_WRITE) /* kqueue bug? */
 				goto read;
 			if (n == IOBUF_CLOSED)
@@ -565,7 +714,8 @@ io_dispatch(int fd, short ev, void *humppa)
     read:
 
 	if (ev & EV_READ) {
-		if ((n = iobuf_read(io->iobuf, io->sock)) < 0) {
+		iobuf_normalize(&io->iobuf);
+		if ((n = iobuf_read(&io->iobuf, io->sock)) < 0) {
 			if (n == IOBUF_CLOSED)
 				io_callback(io, IO_DISCONNECTED);
 			else {
@@ -587,7 +737,7 @@ leave:
 void
 io_callback(struct io *io, int evt)
 {
-	io->cb(io, evt);
+	io->cb(io, evt, io->arg);
 }
 
 int
@@ -598,8 +748,8 @@ io_connect(struct io *io, const struct sockaddr *sa, const struct sockaddr *bsa)
 	if ((sock = socket(sa->sa_family, SOCK_STREAM, 0)) == -1)
 		goto fail;
 
-	io_set_blocking(sock, 0);
-	io_set_linger(sock, 0);
+	io_set_nonblocking(sock);
+	io_set_nolinger(sock);
 
 	if (bsa && bind(sock, bsa, bsa->sa_len) == -1)
 		goto fail;
@@ -810,7 +960,8 @@ io_dispatch_read_ssl(int fd, short event, void *humppa)
 	}
 
 again:
-	switch ((n = iobuf_read_ssl(io->iobuf, (SSL*)io->ssl))) {
+	iobuf_normalize(&io->iobuf);
+	switch ((n = iobuf_read_ssl(&io->iobuf, (SSL*)io->ssl))) {
 	case IOBUF_WANT_READ:
 		io_reset(io, EV_READ, io_dispatch_read_ssl);
 		break;
@@ -857,7 +1008,7 @@ io_dispatch_write_ssl(int fd, short event, void *humppa)
 	}
 
 	w = io_queued(io);
-	switch ((n = iobuf_write_ssl(io->iobuf, (SSL*)io->ssl))) {
+	switch ((n = iobuf_write_ssl(&io->iobuf, (SSL*)io->ssl))) {
 	case IOBUF_WANT_READ:
 		io_reset(io, EV_READ, io_dispatch_write_ssl);
 		break;
@@ -911,11 +1062,12 @@ io_reload_ssl(struct io *io)
 			ev = EV_READ;
 			dispatch = io_dispatch_read_ssl;
 		}
-		else if (IO_WRITING(io) && !(io->flags & IO_PAUSE_OUT) && io_queued(io)) {
+		else if (IO_WRITING(io) && !(io->flags & IO_PAUSE_OUT) &&
+		    io_queued(io)) {
 			ev = EV_WRITE;
 			dispatch = io_dispatch_write_ssl;
 		}
-		if (! ev)
+		if (!ev)
 			return; /* paused */
 		break;
 	default:

@@ -1,4 +1,4 @@
-/*	$OpenBSD$	*/
+/*	$OpenBSD: lka.c,v 1.199 2017/05/17 14:00:06 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2008 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -57,6 +57,8 @@ static int lka_addrname(const char *, const struct sockaddr *,
     struct addrname *);
 static int lka_mailaddrmap(const char *, const char *, const struct mailaddr *);
 static int lka_X509_verify(struct ca_vrfy_req_msg *, const char *, const char *);
+static void lka_certificate_verify(enum imsg_type, struct ca_vrfy_req_msg *);
+static void lka_certificate_verify_resume(enum imsg_type, struct ca_vrfy_req_msg *);
 
 static void lka_cert_verify(enum imsg_type, struct ca_vrfy_req_msg *);
 static void lka_cert_resume(enum imsg_type, struct ca_vrfy_req_msg *);
@@ -71,8 +73,7 @@ lka_imsg(struct mproc *p, struct imsg *imsg)
 	int			 ret;
 	struct pki		*pki;
 	struct iovec		iov[2];
-	static struct ca_vrfy_req_msg	*req_ca_vrfy_smtp = NULL;
-	static struct ca_vrfy_req_msg	*req_ca_vrfy_mta = NULL;
+	static struct ca_vrfy_req_msg	*req_ca_vrfy = NULL;
 	struct ca_vrfy_req_msg		*req_ca_vrfy_chain;
 	struct ca_cert_req_msg		*req_ca_cert;
 	struct ca_cert_resp_msg		 resp_ca_cert;
@@ -87,6 +88,9 @@ lka_imsg(struct mproc *p, struct imsg *imsg)
 	const char		*tablename, *username, *password, *label;
 	uint64_t		 reqid;
 	int			 v;
+
+	if (imsg == NULL)
+		lka_shutdown();
 
 	if (imsg->hdr.type == IMSG_MTA_DNS_HOST ||
 	    imsg->hdr.type == IMSG_MTA_DNS_PTR ||
@@ -141,53 +145,61 @@ lka_imsg(struct mproc *p, struct imsg *imsg)
 			m_close(p);
 			return;
 
-		case IMSG_SMTP_SSL_INIT:
+		case IMSG_SMTP_TLS_INIT:
+		case IMSG_MTA_TLS_INIT:
 			req_ca_cert = imsg->data;
 			resp_ca_cert.reqid = req_ca_cert->reqid;
 
 			xlowercase(buf, req_ca_cert->name, sizeof(buf));
 			log_debug("debug: lka: looking up pki \"%s\"", buf);
 			pki = dict_get(env->sc_pki_dict, buf);
+			if (pki == NULL)
+				if (req_ca_cert->fallback)
+					pki = dict_get(env->sc_pki_dict, "*");
 			if (pki == NULL) {
 				resp_ca_cert.status = CA_FAIL;
-				m_compose(p, IMSG_SMTP_SSL_INIT, 0, 0, -1, &resp_ca_cert,
+				m_compose(p, imsg->hdr.type, 0, 0, -1, &resp_ca_cert,
 				    sizeof(resp_ca_cert));
 				return;
 			}
 			resp_ca_cert.status = CA_OK;
 			resp_ca_cert.cert_len = pki->pki_cert_len;
+			(void)strlcpy(resp_ca_cert.name, pki->pki_name, sizeof resp_ca_cert.name);
 			iov[0].iov_base = &resp_ca_cert;
 			iov[0].iov_len = sizeof(resp_ca_cert);
 			iov[1].iov_base = pki->pki_cert;
 			iov[1].iov_len = pki->pki_cert_len;
-			m_composev(p, IMSG_SMTP_SSL_INIT, 0, 0, -1, iov, nitems(iov));
+			m_composev(p, imsg->hdr.type, 0, 0, -1, iov, nitems(iov));
 			return;
 
-		case IMSG_SMTP_SSL_VERIFY_CERT:
-			req_ca_vrfy_smtp = xmemdup(imsg->data, sizeof *req_ca_vrfy_smtp, "lka:ca_vrfy");
-			req_ca_vrfy_smtp->cert = xmemdup((char *)imsg->data +
-			    sizeof *req_ca_vrfy_smtp, req_ca_vrfy_smtp->cert_len, "lka:ca_vrfy");
-			req_ca_vrfy_smtp->chain_cert = xcalloc(req_ca_vrfy_smtp->n_chain,
+		case IMSG_SMTP_TLS_VERIFY_CERT:
+		case IMSG_MTA_TLS_VERIFY_CERT:
+			req_ca_vrfy = xmemdup(imsg->data, sizeof *req_ca_vrfy, "lka:ca_vrfy");
+			req_ca_vrfy->cert = xmemdup((char *)imsg->data +
+			    sizeof *req_ca_vrfy, req_ca_vrfy->cert_len, "lka:ca_vrfy");
+			req_ca_vrfy->chain_cert = xcalloc(req_ca_vrfy->n_chain,
 			    sizeof (unsigned char *), "lka:ca_vrfy");
-			req_ca_vrfy_smtp->chain_cert_len = xcalloc(req_ca_vrfy_smtp->n_chain,
+			req_ca_vrfy->chain_cert_len = xcalloc(req_ca_vrfy->n_chain,
 			    sizeof (off_t), "lka:ca_vrfy");
 			return;
 
-		case IMSG_SMTP_SSL_VERIFY_CHAIN:
-			if (req_ca_vrfy_smtp == NULL)
+		case IMSG_SMTP_TLS_VERIFY_CHAIN:
+		case IMSG_MTA_TLS_VERIFY_CHAIN:
+			if (req_ca_vrfy == NULL)
 				fatalx("lka:ca_vrfy: chain without a certificate");
 			req_ca_vrfy_chain = imsg->data;
-			req_ca_vrfy_smtp->chain_cert[req_ca_vrfy_smtp->chain_offset] = xmemdup((char *)imsg->data +
+			req_ca_vrfy->chain_cert[req_ca_vrfy->chain_offset] = xmemdup((char *)imsg->data +
 			    sizeof *req_ca_vrfy_chain, req_ca_vrfy_chain->cert_len, "lka:ca_vrfy");
-			req_ca_vrfy_smtp->chain_cert_len[req_ca_vrfy_smtp->chain_offset] = req_ca_vrfy_chain->cert_len;
-			req_ca_vrfy_smtp->chain_offset++;
+			req_ca_vrfy->chain_cert_len[req_ca_vrfy->chain_offset] = req_ca_vrfy_chain->cert_len;
+			req_ca_vrfy->chain_offset++;
 			return;
 
-		case IMSG_SMTP_SSL_VERIFY:
-			if (req_ca_vrfy_smtp == NULL)
+		case IMSG_SMTP_TLS_VERIFY:
+		case IMSG_MTA_TLS_VERIFY:
+			if (req_ca_vrfy == NULL)
 				fatalx("lka:ca_vrfy: verify without a certificate");
-
-			lka_cert_verify(imsg->hdr.type, req_ca_vrfy_smtp);
+			lka_certificate_verify(imsg->hdr.type, req_ca_vrfy);
+			req_ca_vrfy = NULL;
 			return;
 
 		case IMSG_SMTP_AUTHENTICATE:
@@ -241,56 +253,6 @@ lka_imsg(struct mproc *p, struct imsg *imsg)
 
 	if (p->proc == PROC_PONY) {
 		switch (imsg->hdr.type) {
-
-		case IMSG_MTA_SSL_INIT:
-			req_ca_cert = imsg->data;
-			resp_ca_cert.reqid = req_ca_cert->reqid;
-
-			xlowercase(buf, req_ca_cert->name, sizeof(buf));
-			log_debug("debug: lka: looking up pki \"%s\"", buf);
-			pki = dict_get(env->sc_pki_dict, buf);
-			if (pki == NULL) {
-				resp_ca_cert.status = CA_FAIL;
-				m_compose(p, IMSG_MTA_SSL_INIT, 0, 0, -1, &resp_ca_cert,
-				    sizeof(resp_ca_cert));
-				return;
-			}
-			resp_ca_cert.status = CA_OK;
-			resp_ca_cert.cert_len = pki->pki_cert_len;
-			iov[0].iov_base = &resp_ca_cert;
-			iov[0].iov_len = sizeof(resp_ca_cert);
-			iov[1].iov_base = pki->pki_cert;
-			iov[1].iov_len = pki->pki_cert_len;
-			m_composev(p, IMSG_MTA_SSL_INIT, 0, 0, -1, iov, nitems(iov));
-			return;
-
-		case IMSG_MTA_SSL_VERIFY_CERT:
-			req_ca_vrfy_mta = xmemdup(imsg->data, sizeof *req_ca_vrfy_mta, "lka:ca_vrfy");
-			req_ca_vrfy_mta->cert = xmemdup((char *)imsg->data +
-			    sizeof *req_ca_vrfy_mta, req_ca_vrfy_mta->cert_len, "lka:ca_vrfy");
-			req_ca_vrfy_mta->chain_cert = xcalloc(req_ca_vrfy_mta->n_chain,
-			    sizeof (unsigned char *), "lka:ca_vrfy");
-			req_ca_vrfy_mta->chain_cert_len = xcalloc(req_ca_vrfy_mta->n_chain,
-			    sizeof (off_t), "lka:ca_vrfy");
-			return;
-
-		case IMSG_MTA_SSL_VERIFY_CHAIN:
-			if (req_ca_vrfy_mta == NULL)
-				fatalx("lka:ca_vrfy: verify without a certificate");
-
-			req_ca_vrfy_chain = imsg->data;
-			req_ca_vrfy_mta->chain_cert[req_ca_vrfy_mta->chain_offset] = xmemdup((char *)imsg->data +
-			    sizeof *req_ca_vrfy_chain, req_ca_vrfy_chain->cert_len, "lka:ca_vrfy");
-			req_ca_vrfy_mta->chain_cert_len[req_ca_vrfy_mta->chain_offset] = req_ca_vrfy_chain->cert_len;
-			req_ca_vrfy_mta->chain_offset++;
-			return;
-
-		case IMSG_MTA_SSL_VERIFY:
-			if (req_ca_vrfy_mta == NULL)
-				fatalx("lka:ca_vrfy: verify without a certificate");
-
-			lka_cert_verify(imsg->hdr.type, req_ca_vrfy_mta);
-			return;
 
 		case IMSG_MTA_LOOKUP_CREDENTIALS:
 			m_msg(&m, imsg);
@@ -365,9 +327,16 @@ lka_imsg(struct mproc *p, struct imsg *imsg)
 			return;
 
 		case IMSG_CONF_END:
-			if (verbose & TRACE_TABLES)
+			if (tracing & TRACE_TABLES)
 				table_dump_all();
+
+			/* fork & exec tables that need it */
 			table_open_all();
+
+			/* revoke proc & exec */
+			if (pledge("stdio rpath inet dns getpw recvfd",
+				NULL) == -1)
+				err(1, "pledge");
 
 			/* Start fulfilling requests */
 			mproc_enable(p_pony);
@@ -391,7 +360,7 @@ lka_imsg(struct mproc *p, struct imsg *imsg)
 			m_msg(&m, imsg);
 			m_get_int(&m, &v);
 			m_end(&m);
-			log_verbose(v);
+			log_trace_verbose(v);
 			return;
 
 		case IMSG_CTL_PROFILE:
@@ -423,10 +392,6 @@ lka_sig_handler(int sig, short event, void *p)
 	pid_t pid;
 
 	switch (sig) {
-	case SIGINT:
-	case SIGTERM:
-		lka_shutdown();
-		break;
 	case SIGCHLD:
 		do {
 			pid = waitpid(-1, &status, WNOHANG);
@@ -440,28 +405,15 @@ lka_sig_handler(int sig, short event, void *p)
 void
 lka_shutdown(void)
 {
-	log_info("info: lookup agent exiting");
+	log_debug("debug: lookup agent exiting");
 	_exit(0);
 }
 
-pid_t
+int
 lka(void)
 {
-	pid_t		 pid;
 	struct passwd	*pw;
-	struct event	 ev_sigint;
-	struct event	 ev_sigterm;
 	struct event	 ev_sigchld;
-
-	switch (pid = fork()) {
-	case -1:
-		fatal("lka: cannot fork");
-	case 0:
-		post_fork(PROC_LKA);
-		break;
-	default:
-		return (pid);
-	}
 
 	purge_config(PURGE_LISTENERS);
 
@@ -470,7 +422,7 @@ lka(void)
 
 	config_process(PROC_LKA);
 
-	if (setgroups(1, &pw->pw_gid) ||
+	if (initgroups(pw->pw_name, pw->pw_gid) ||
 	    setresgid(pw->pw_gid, pw->pw_gid, pw->pw_gid) ||
 	    setresuid(pw->pw_uid, pw->pw_uid, pw->pw_uid))
 		fatal("lka: cannot drop privileges");
@@ -478,12 +430,10 @@ lka(void)
 	imsg_callback = lka_imsg;
 	event_init();
 
-	signal_set(&ev_sigint, SIGINT, lka_sig_handler, NULL);
-	signal_set(&ev_sigterm, SIGTERM, lka_sig_handler, NULL);
 	signal_set(&ev_sigchld, SIGCHLD, lka_sig_handler, NULL);
-	signal_add(&ev_sigint, NULL);
-	signal_add(&ev_sigterm, NULL);
 	signal_add(&ev_sigchld, NULL);
+	signal(SIGINT, SIG_IGN);
+	signal(SIGTERM, SIG_IGN);
 	signal(SIGPIPE, SIG_IGN);
 	signal(SIGHUP, SIG_IGN);
 
@@ -491,14 +441,16 @@ lka(void)
 	config_peer(PROC_QUEUE);
 	config_peer(PROC_CONTROL);
 	config_peer(PROC_PONY);
-	config_done();
 
 	/* Ignore them until we get our config */
 	mproc_disable(p_pony);
 
-	if (event_dispatch() < 0)
-		fatal("event_dispatch");
-	lka_shutdown();
+	/* proc & exec will be revoked before serving requests */
+	if (pledge("stdio rpath inet dns getpw recvfd proc exec", NULL) == -1)
+		err(1, "pledge");
+
+	event_dispatch();
+	fatalx("exited event loop");
 
 	return (0);
 }
@@ -507,6 +459,7 @@ static int
 lka_authenticate(const char *tablename, const char *user, const char *password)
 {
 	struct table		*table;
+	char			*cpass;
 	union lookup		 lk;
 
 	log_debug("debug: lka: authenticating for %s:%s", tablename, user);
@@ -525,7 +478,10 @@ lka_authenticate(const char *tablename, const char *user, const char *password)
 	case 0:
 		return (LKA_PERMFAIL);
 	default:
-		if (!strcmp(lk.creds.password, crypt(password, lk.creds.password)))
+		cpass = crypt(password, lk.creds.password);
+		if (cpass == NULL)
+			return (LKA_PERMFAIL);
+		if (!strcmp(lk.creds.password, cpass))
 			return (LKA_OK);
 		return (LKA_PERMFAIL);
 	}
@@ -565,7 +521,7 @@ lka_credentials(const char *tablename, const char *label, char *dst, size_t sz)
 
 		r = base64_encode((unsigned char *)buf, buflen, dst, sz);
 		free(buf);
-		
+
 		if (r == -1) {
 			log_warnx("warn: credentials parse error for %s:%s",
 			    tablename, label);
@@ -629,13 +585,12 @@ lka_addrname(const char *tablename, const struct sockaddr *sa,
 		*res = lk.addrname;
 		return (LKA_OK);
 	}
-}      
+}
 
 static int
 lka_mailaddrmap(const char *tablename, const char *username, const struct mailaddr *maddr)
 {
 	struct table	       *table;
-	struct maddrmap	       *mm;
 	struct maddrnode       *mn;
 	union lookup		lk;
 	int			found;
@@ -655,10 +610,9 @@ lka_mailaddrmap(const char *tablename, const char *username, const struct mailad
 	case 0:
 		return (LKA_PERMFAIL);
 	default:
-		mm = lk.maddrmap;
 		found = 0;
 		TAILQ_FOREACH(mn, &lk.maddrmap->queue, entries) {
-			if (! mailaddr_match(maddr, &mn->mailaddr))
+			if (!mailaddr_match(maddr, &mn->mailaddr))
 				continue;
 			found = 1;
 			break;
@@ -703,16 +657,14 @@ lka_X509_verify(struct ca_vrfy_req_msg *vrfy,
 			x509_tmp = NULL;
 		}
 	}
-	if (! ca_X509_verify(x509, x509_chain, CAfile, NULL, &errstr))
+	if (!ca_X509_verify(x509, x509_chain, CAfile, NULL, &errstr))
 		log_debug("debug: lka: X509 verify: %s", errstr);
 	else
 		ret = 1;
 
-end:	
-	if (x509)
-		X509_free(x509);
-	if (x509_tmp)
-		X509_free(x509_tmp);
+end:
+	X509_free(x509);
+	X509_free(x509_tmp);
 	if (x509_chain)
 		sk_X509_pop_free(x509_chain, X509_free);
 
@@ -720,14 +672,13 @@ end:
 }
 
 
-/**/
 static void
-lka_cert_verify(enum imsg_type type, struct ca_vrfy_req_msg *req)
+lka_certificate_verify(enum imsg_type type, struct ca_vrfy_req_msg *req)
 {
 	char	buffer[1024];
 
 	if (type == IMSG_SMTP_SSL_VERIFY) {
-		lka_cert_resume(type, req);
+		lka_certificate_verify_resume(type, req);
 		return;
 	};
 	
@@ -838,23 +789,27 @@ fail:
 }
 
 static void
-lka_cert_resume(enum imsg_type type, struct ca_vrfy_req_msg *req)
+lka_certificate_verify_resume(enum imsg_type type, struct ca_vrfy_req_msg *req)
 {
-	struct ca_vrfy_resp_msg	resp;
-	struct pki	       *pki;
-	const char	       *cafile;
-	size_t			i;
+	struct ca_vrfy_resp_msg		resp;
+	struct ca		       *sca;
+	const char		       *cafile;
+	size_t				i;
 
 	resp.reqid = req->reqid;
-	pki = dict_get(env->sc_pki_dict, req->pkiname);
-	cafile = CA_FILE;
-	if (pki && pki->pki_ca_file)
-		cafile = pki->pki_ca_file;
+	sca = dict_get(env->sc_ca_dict, req->name);
+	if (sca == NULL)
+		if (req->fallback)
+			sca = dict_get(env->sc_ca_dict, "*");
+	cafile = sca ? sca->ca_cert_file : CA_FILE;
 
-	if (! lka_X509_verify(req, cafile, NULL))
+	if (sca == NULL && !req->fallback)
+		resp.status = CA_FAIL;
+	else if (!lka_X509_verify(req, cafile, NULL))
 		resp.status = CA_FAIL;
 	else
 		resp.status = CA_OK;
+
 	m_compose(p_pony, type, 0, 0, -1, &resp,
 	    sizeof resp);
 

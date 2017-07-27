@@ -1,4 +1,4 @@
-/*	$OpenBSD: queue_fs.c,v 1.5 2014/04/19 13:48:57 gilles Exp $	*/
+/*	$OpenBSD: queue_fs.c,v 1.14 2015/12/30 11:40:30 jung Exp $	*/
 
 /*
  * Copyright (c) 2011 Gilles Chehade <gilles@poolp.org>
@@ -17,7 +17,6 @@
  */
 
 #include <sys/types.h>
-#include <sys/param.h>	/* for OpenBSD-5.6, DO NOT BACKPORT TO OpenBSD-current ! */
 #include <sys/mount.h>
 #include <sys/queue.h>
 #include <sys/tree.h>
@@ -34,7 +33,6 @@
 #include <imsg.h>
 #include <inttypes.h>
 #include <libgen.h>
-#include <limits.h>
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,8 +49,9 @@
 #define PATH_EVPTMP		PATH_INCOMING "/envelope.tmp"
 #define PATH_MESSAGE		"/message"
 
-/* minimum number of free blocks on filesystem */
-#define	MINFREEBLOCKS		100
+/* percentage of remaining space / inodes required to accept new messages */
+#define	MINSPACE		5
+#define	MININODES		5
 
 struct qwalk {
 	FTS	*fts;
@@ -81,7 +80,7 @@ queue_fs_message_create(uint32_t *msgid)
 	char		rootdir[PATH_MAX];
 	struct stat	sb;
 
-	if (! fsqueue_check_space())
+	if (!fsqueue_check_space())
 		return 0;
 
 again:
@@ -166,9 +165,6 @@ queue_fs_message_commit(uint32_t msgid, const char *path)
 		log_warn("warn: queue-fs: rename");
 		return 0;
 	}
-
-	/* best effort */
-	sync();
 
 	return 1;
 }
@@ -262,7 +258,7 @@ queue_fs_message_uncorrupt(uint32_t msgid)
 		return (0);
 	}
 
-	if (! bsnprintf(bucketdir, sizeof bucketdir, "%s/%02x", PATH_QUEUE,
+	if (!bsnprintf(bucketdir, sizeof bucketdir, "%s/%02x", PATH_QUEUE,
 	    (msgid & 0xff000000) >> 24)) {
 		log_warnx("warn: queue-fs: path too long");
 		return (0);
@@ -298,7 +294,7 @@ queue_fs_envelope_create(uint32_t msgid, const char *buf, size_t len,
 		log_warnx("warn: queue-fs: msgid=0, evpid=%016"PRIx64, *evpid);
 		goto done;
 	}
-	
+
 	fsqueue_message_incoming_path(msgid, path, sizeof(path));
 	if (stat(path, &sb) == -1)
 		queued = 1;
@@ -407,7 +403,7 @@ queue_fs_message_walk(uint64_t *evpid, char *buf, size_t len,
 	if (*done)
 		return (-1);
 
-	if (! bsnprintf(path, sizeof path, "%s/%02x/%08x",
+	if (!bsnprintf(path, sizeof path, "%s/%02x/%08x",
 	    PATH_QUEUE, (msgid  & 0xff000000) >> 24, msgid))
 		fatalx("queue_fs_message_walk: path does not fit buffer");
 
@@ -427,7 +423,8 @@ queue_fs_message_walk(uint64_t *evpid, char *buf, size_t len,
 			continue;
 
 		/* ignore files other than envelopes */
-		if (strlen(dp->d_name) != 16 || strncmp(dp->d_name, msgid_str, 8))
+		if (strlen(dp->d_name) != 16 ||
+		    strncmp(dp->d_name, msgid_str, 8))
 			continue;
 
 		tmp = NULL;
@@ -493,6 +490,8 @@ static int
 fsqueue_check_space(void)
 {
 	struct statfs	buf;
+	uint64_t	used;
+	uint64_t	total;
 
 	if (statfs(PATH_QUEUE, &buf) < 0) {
 		log_warn("warn: queue-fs: statfs");
@@ -508,8 +507,29 @@ fsqueue_check_space(void)
 	    (int64_t)buf.f_bfree == -1 || (int64_t)buf.f_ffree == -1)
 		return 1;
 
-	if (buf.f_bavail < MINFREEBLOCKS) {
-		log_warnx("warn: disk space running low, temporarily rejecting messages");
+	used = buf.f_blocks - buf.f_bfree;
+	total = buf.f_bavail + used;
+	if (total != 0)
+		used = (float)used / (float)total * 100;
+	else
+		used = 100;
+	if (100 - used < MINSPACE) {
+		log_warnx("warn: not enough disk space: %llu%% left",
+		    (unsigned long long) 100 - used);
+		log_warnx("warn: temporarily rejecting messages");
+		return 0;
+	}
+
+	used = buf.f_files - buf.f_ffree;
+	total = buf.f_favail + used;
+	if (total != 0)
+		used = (float)used / (float)total * 100;
+	else
+		used = 100;
+	if (100 - used < MININODES) {
+		log_warnx("warn: not enough inodes: %llu%% left",
+		    (unsigned long long) 100 - used);
+		log_warnx("warn: temporarily rejecting messages");
 		return 0;
 	}
 
@@ -519,7 +539,7 @@ fsqueue_check_space(void)
 static void
 fsqueue_envelope_path(uint64_t evpid, char *buf, size_t len)
 {
-	if (! bsnprintf(buf, len, "%s/%02x/%08x/%016" PRIx64,
+	if (!bsnprintf(buf, len, "%s/%02x/%08x/%016" PRIx64,
 		PATH_QUEUE,
 		(evpid_to_msgid(evpid) & 0xff000000) >> 24,
 		evpid_to_msgid(evpid),
@@ -530,7 +550,7 @@ fsqueue_envelope_path(uint64_t evpid, char *buf, size_t len)
 static void
 fsqueue_envelope_incoming_path(uint64_t evpid, char *buf, size_t len)
 {
-	if (! bsnprintf(buf, len, "%s/%08x/%016" PRIx64,
+	if (!bsnprintf(buf, len, "%s/%08x/%016" PRIx64,
 		PATH_INCOMING,
 		evpid_to_msgid(evpid),
 		evpid))
@@ -596,7 +616,7 @@ tempfail:
 static void
 fsqueue_message_path(uint32_t msgid, char *buf, size_t len)
 {
-	if (! bsnprintf(buf, len, "%s/%02x/%08x",
+	if (!bsnprintf(buf, len, "%s/%02x/%08x",
 		PATH_QUEUE,
 		(msgid & 0xff000000) >> 24,
 		msgid))
@@ -606,7 +626,7 @@ fsqueue_message_path(uint32_t msgid, char *buf, size_t len)
 static void
 fsqueue_message_corrupt_path(uint32_t msgid, char *buf, size_t len)
 {
-	if (! bsnprintf(buf, len, "%s/%08x",
+	if (!bsnprintf(buf, len, "%s/%08x",
 		PATH_CORRUPT,
 		msgid))
 		fatalx("fsqueue_message_corrupt_path: path does not fit buffer");
@@ -615,7 +635,7 @@ fsqueue_message_corrupt_path(uint32_t msgid, char *buf, size_t len)
 static void
 fsqueue_message_incoming_path(uint32_t msgid, char *buf, size_t len)
 {
-	if (! bsnprintf(buf, len, "%s/%08x",
+	if (!bsnprintf(buf, len, "%s/%08x",
 		PATH_INCOMING,
 		msgid))
 		fatalx("fsqueue_message_incoming_path: path does not fit buffer");

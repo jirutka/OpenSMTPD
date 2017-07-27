@@ -1,4 +1,4 @@
-/*	$OpenBSD: ca.c,v 1.10 2014/07/10 20:16:48 jsg Exp $	*/
+/*	$OpenBSD: ca.c,v 1.27 2017/05/17 14:00:06 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2014 Reyk Floeter <reyk@openbsd.org>
@@ -22,14 +22,14 @@
 #include <sys/socket.h>
 #include <sys/tree.h>
 
-#include <string.h>
+#include <err.h>
+#include <imsg.h>
 #include <limits.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
-#include <imsg.h>
-#include <pwd.h>
-#include <err.h>
 
 #include <openssl/ssl.h>
 #include <openssl/pem.h>
@@ -44,21 +44,21 @@
 
 static int	 ca_verify_cb(int, X509_STORE_CTX *);
 
-static int	 rsae_send_imsg(int, const u_char *, u_char *, RSA *,
-		    int, u_int);
-static int	 rsae_pub_enc(int, const u_char *, u_char *, RSA *, int);
-static int	 rsae_pub_dec(int,const u_char *, u_char *, RSA *, int);
-static int	 rsae_priv_enc(int, const u_char *, u_char *, RSA *, int);
-static int	 rsae_priv_dec(int, const u_char *, u_char *, RSA *, int);
+static int	 rsae_send_imsg(int, const unsigned char *, unsigned char *,
+		    RSA *, int, unsigned int);
+static int	 rsae_pub_enc(int, const unsigned char *, unsigned char *,
+		    RSA *, int);
+static int	 rsae_pub_dec(int,const unsigned char *, unsigned char *,
+		    RSA *, int);
+static int	 rsae_priv_enc(int, const unsigned char *, unsigned char *,
+		    RSA *, int);
+static int	 rsae_priv_dec(int, const unsigned char *, unsigned char *,
+		    RSA *, int);
 static int	 rsae_mod_exp(BIGNUM *, const BIGNUM *, RSA *, BN_CTX *);
 static int	 rsae_bn_mod_exp(BIGNUM *, const BIGNUM *, const BIGNUM *,
 		    const BIGNUM *, BN_CTX *, BN_MONT_CTX *);
 static int	 rsae_init(RSA *);
 static int	 rsae_finish(RSA *);
-static int	 rsae_sign(int, const u_char *, u_int, u_char *, u_int *,
-		    const RSA *);
-static int	 rsae_verify(int dtype, const u_char *m, u_int, const u_char *,
-		    u_int, const RSA *);
 static int	 rsae_keygen(RSA *, int, BIGNUM *, BN_GENCB *);
 
 static uint64_t	 rsae_reqid = 0;
@@ -66,40 +66,14 @@ static uint64_t	 rsae_reqid = 0;
 static void
 ca_shutdown(void)
 {
-	log_info("info: ca agent exiting");
+	log_debug("debug: ca agent exiting");
 	_exit(0);
 }
 
-static void
-ca_sig_handler(int sig, short event, void *p)
-{
-	switch (sig) {
-	case SIGINT:
-	case SIGTERM:
-		ca_shutdown();
-		break;
-	default:
-		fatalx("ca_sig_handler: unexpected signal");
-	}
-}
-
-pid_t
+int
 ca(void)
 {
-	pid_t		 pid;
 	struct passwd	*pw;
-	struct event	 ev_sigint;
-	struct event	 ev_sigterm;
-
-	switch (pid = fork()) {
-	case -1:
-		fatal("ca: cannot fork");
-	case 0:
-		post_fork(PROC_CA);
-		break;
-	default:
-		return (pid);
-	}
 
 	purge_config(PURGE_LISTENERS|PURGE_TABLES|PURGE_RULES);
 
@@ -121,24 +95,23 @@ ca(void)
 	imsg_callback = ca_imsg;
 	event_init();
 
-	signal_set(&ev_sigint, SIGINT, ca_sig_handler, NULL);
-	signal_set(&ev_sigterm, SIGTERM, ca_sig_handler, NULL);
-	signal_add(&ev_sigint, NULL);
-	signal_add(&ev_sigterm, NULL);
+	signal(SIGINT, SIG_IGN);
+	signal(SIGTERM, SIG_IGN);
 	signal(SIGPIPE, SIG_IGN);
 	signal(SIGHUP, SIG_IGN);
 
 	config_peer(PROC_CONTROL);
 	config_peer(PROC_PARENT);
 	config_peer(PROC_PONY);
-	config_done();
 
 	/* Ignore them until we get our config */
 	mproc_disable(p_pony);
 
-	if (event_dispatch() < 0)
-		fatal("event_dispatch");
-	ca_shutdown();
+	if (pledge("stdio", NULL) == -1)
+		err(1, "pledge");
+
+	event_dispatch();
+	fatalx("exited event loop");
 
 	return (0);
 }
@@ -169,8 +142,7 @@ ca_init(void)
 
 		pki->pki_pkey = pkey;
 
-		explicit_bzero(pki->pki_key, pki->pki_key_len);
-		free(pki->pki_key);
+		freezero(pki->pki_key, pki->pki_key_len);
 		pki->pki_key = NULL;
 	}
 }
@@ -206,7 +178,7 @@ ca_X509_verify(void *certificate, void *chain, const char *CAfile,
 	if ((store = X509_STORE_new()) == NULL)
 		goto end;
 
-	if (! X509_STORE_load_locations(store, CAfile, NULL)) {
+	if (!X509_STORE_load_locations(store, CAfile, NULL)) {
 		log_warn("warn: unable to load CA file %s", CAfile);
 		goto end;
 	}
@@ -231,10 +203,8 @@ end:
 			*errstr = ERR_error_string(ERR_peek_last_error(), NULL);
 	}
 
-	if (xsc)
-		X509_STORE_CTX_free(xsc);
-	if (store)
-		X509_STORE_free(store);
+	X509_STORE_CTX_free(xsc);
+	X509_STORE_free(store);
 
 	return ret > 0 ? 1 : 0;
 }
@@ -244,7 +214,7 @@ ca_imsg(struct mproc *p, struct imsg *imsg)
 {
 	RSA			*rsa;
 	const void		*from = NULL;
-	u_char			 *to = NULL;
+	unsigned char		*to = NULL;
 	struct msg		 m;
 	const char		*pkiname;
 	size_t			 flen, tlen, padding;
@@ -252,6 +222,9 @@ ca_imsg(struct mproc *p, struct imsg *imsg)
 	int			 ret = 0;
 	uint64_t		 id;
 	int			 v;
+
+	if (imsg == NULL)
+		ca_shutdown();
 
 	if (p->proc == PROC_PARENT) {
 		switch (imsg->hdr.type) {
@@ -272,7 +245,7 @@ ca_imsg(struct mproc *p, struct imsg *imsg)
 			m_msg(&m, imsg);
 			m_get_int(&m, &v);
 			m_end(&m);
-			log_verbose(v);
+			log_trace_verbose(v);
 			return;
 		case IMSG_CTL_PROFILE:
 			m_msg(&m, imsg);
@@ -349,14 +322,14 @@ static RSA_METHOD rsae_method = {
 	rsae_finish,
 	0,
 	NULL,
-	rsae_sign,
-	rsae_verify,
+	NULL,
+	NULL,
 	rsae_keygen
 };
 
 static int
-rsae_send_imsg(int flen, const u_char *from, u_char *to, RSA *rsa,
-    int padding, u_int cmd)
+rsae_send_imsg(int flen, const unsigned char *from, unsigned char *to,
+    RSA *rsa, int padding, unsigned int cmd)
 {
 	int		 ret = 0;
 	struct imsgbuf	*ibuf;
@@ -387,7 +360,7 @@ rsae_send_imsg(int flen, const u_char *from, u_char *to, RSA *rsa,
 	ibuf = &p_ca->imsgbuf;
 
 	while (!done) {
-		if ((n = imsg_read(ibuf)) == -1)
+		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
 			fatalx("imsg_read");
 		if (n == 0)
 			fatalx("pipe closed");
@@ -433,21 +406,24 @@ rsae_send_imsg(int flen, const u_char *from, u_char *to, RSA *rsa,
 }
 
 static int
-rsae_pub_enc(int flen,const u_char *from, u_char *to, RSA *rsa,int padding)
+rsae_pub_enc(int flen,const unsigned char *from, unsigned char *to, RSA *rsa,
+    int padding)
 {
 	log_debug("debug: %s: %s", proc_name(smtpd_process), __func__);
 	return (rsa_default->rsa_pub_enc(flen, from, to, rsa, padding));
 }
 
 static int
-rsae_pub_dec(int flen,const u_char *from, u_char *to, RSA *rsa,int padding)
+rsae_pub_dec(int flen,const unsigned char *from, unsigned char *to, RSA *rsa,
+    int padding)
 {
 	log_debug("debug: %s: %s", proc_name(smtpd_process), __func__);
 	return (rsa_default->rsa_pub_dec(flen, from, to, rsa, padding));
 }
 
 static int
-rsae_priv_enc(int flen, const u_char *from, u_char *to, RSA *rsa, int padding)
+rsae_priv_enc(int flen, const unsigned char *from, unsigned char *to, RSA *rsa,
+    int padding)
 {
 	log_debug("debug: %s: %s", proc_name(smtpd_process), __func__);
 	if (RSA_get_ex_data(rsa, 0) != NULL) {
@@ -458,7 +434,8 @@ rsae_priv_enc(int flen, const u_char *from, u_char *to, RSA *rsa, int padding)
 }
 
 static int
-rsae_priv_dec(int flen, const u_char *from, u_char *to, RSA *rsa, int padding)
+rsae_priv_dec(int flen, const unsigned char *from, unsigned char *to, RSA *rsa,
+    int padding)
 {
 	log_debug("debug: %s: %s", proc_name(smtpd_process), __func__);
 	if (RSA_get_ex_data(rsa, 0) != NULL) {
@@ -499,24 +476,6 @@ rsae_finish(RSA *rsa)
 	if (rsa_default->finish == NULL)
 		return (1);
 	return (rsa_default->finish(rsa));
-}
-
-static int
-rsae_sign(int type, const u_char *m, u_int m_length, u_char *sigret,
-    u_int *siglen, const RSA *rsa)
-{
-	log_debug("debug: %s: %s", proc_name(smtpd_process), __func__);
-	return (rsa_default->rsa_sign(type, m, m_length,
-	    sigret, siglen, rsa));
-}
-
-static int
-rsae_verify(int dtype, const u_char *m, u_int m_length, const u_char *sigbuf,
-    u_int siglen, const RSA *rsa)
-{
-	log_debug("debug: %s: %s", proc_name(smtpd_process), __func__);
-	return (rsa_default->rsa_verify(dtype, m, m_length,
-	    sigbuf, siglen, rsa));
 }
 
 static int

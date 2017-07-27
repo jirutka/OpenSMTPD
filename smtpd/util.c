@@ -1,4 +1,4 @@
-/*	$OpenBSD: util.c,v 1.110 2014/05/25 10:55:36 espie Exp $	*/
+/*	$OpenBSD: util.c,v 1.132 2017/01/09 14:49:22 reyk Exp $	*/
 
 /*
  * Copyright (c) 2000,2001 Markus Friedl.  All rights reserved.
@@ -53,6 +53,10 @@
 
 const char *log_in6addr(const struct in6_addr *);
 const char *log_sockaddr(struct sockaddr *);
+static int  parse_mailname_file(char *, size_t);
+
+int	tracing = 0;
+int	foreground_log = 0;
 
 void *
 xmalloc(size_t size, const char *where)
@@ -108,29 +112,31 @@ xmemdup(const void *ptr, size_t size, const char *where)
 }
 
 #if !defined(NO_IO)
-void
-iobuf_xinit(struct iobuf *io, size_t size, size_t max, const char *where)
-{
-	if (iobuf_init(io, size, max) == -1) {
-		log_warnx("%s: iobuf_init(%p, %zu, %zu)", where, io, size, max);
-		fatalx("exiting");
-	}
-}
-
-void
-iobuf_xfqueue(struct iobuf *io, const char *where, const char *fmt, ...)
+int
+io_xprintf(struct io *io, const char *fmt, ...)
 {
 	va_list	ap;
-	int	len;
+	int len;
 
 	va_start(ap, fmt);
-	len = iobuf_vfqueue(io, fmt, ap);
+	len = io_vprintf(io, fmt, ap);
 	va_end(ap);
+	if (len == -1)
+		fatal("io_xprintf(%p, %s, ...)", io, fmt);
 
-	if (len == -1) {
-		log_warnx("%s: iobuf_xfqueue(%p, %s, ...)", where, io, fmt);
-		fatalx("exiting");
-	}
+	return len;
+}
+
+int
+io_xprint(struct io *io, const char *str)
+{
+	int len;
+
+	len = io_print(io, str);
+	if (len == -1)
+		fatal("io_xprint(%p, %s, ...)", io, str);
+
+	return len;
 }
 #endif
 
@@ -139,11 +145,11 @@ strip(char *s)
 {
 	size_t	 l;
 
-	while (*s == ' ' || *s == '\t')
+	while (isspace((unsigned char)*s))
 		s++;
 
 	for (l = strlen(s); l; l--) {
-		if (s[l-1] != ' ' && s[l-1] != '\t')
+		if (!isspace((unsigned char)s[l-1]))
 			break;
 		s[l-1] = '\0';
 	}
@@ -178,7 +184,7 @@ mkdirs_component(char *path, mode_t mode)
 		if (mkdir(path, mode | S_IWUSR | S_IXUSR) == -1)
 			return 0;
 	}
-	else if (! S_ISDIR(sb.st_mode))
+	else if (!S_ISDIR(sb.st_mode))
 		return 0;
 
 	return 1;
@@ -204,7 +210,7 @@ mkdirs(char *path, mode_t mode)
 	for (p = path; *p; p++) {
 		if (*p == '/') {
 			if (buf[0] != '\0')
-				if (! mkdirs_component(buf, mode))
+				if (!mkdirs_component(buf, mode))
 					return 0;
 			while (*p == '/')
 				p++;
@@ -216,8 +222,8 @@ mkdirs(char *path, mode_t mode)
 		}
 		buf[i++] = *p;
 	}
-	if (! done)
-		if (! mkdirs_component(buf, mode))
+	if (!done)
+		if (!mkdirs_component(buf, mode))
 			return 0;
 
 	if (chmod(path, mode) == -1)
@@ -225,7 +231,6 @@ mkdirs(char *path, mode_t mode)
 
 	return 1;
 }
-
 
 int
 ckdir(const char *path, mode_t mode, uid_t owner, gid_t group, int create)
@@ -377,20 +382,17 @@ mktmpfile(void)
 {
 	char		path[PATH_MAX];
 	int		fd;
-	mode_t		omode;
 
-	if (! bsnprintf(path, sizeof(path), "%s/smtpd.XXXXXXXXXX",
+	if (!bsnprintf(path, sizeof(path), "%s/smtpd.XXXXXXXXXX",
 		PATH_TEMPORARY)) {
 		log_warn("snprintf");
 		fatal("exiting");
 	}
 
-	omode = umask(7077);
 	if ((fd = mkstemp(path)) == -1) {
 		log_warn("cannot create temporary file %s", path);
 		fatal("exiting");
 	}
-	umask(omode);
 	unlink(path);
 	return (fd);
 }
@@ -452,15 +454,15 @@ mailaddr_match(const struct mailaddr *maddr1, const struct mailaddr *maddr2)
 	/* catchall */
 	if (m2.user[0] == '\0' && m2.domain[0] == '\0')
 		return 1;
-	
-	if (! hostname_match(m1.domain, m2.domain))
+
+	if (!hostname_match(m1.domain, m2.domain))
 		return 0;
 
 	if (m2.user[0]) {
 		/* if address from table has a tag, we must respect it */
-		if (strchr(m2.user, '+') == NULL) {
+		if (strchr(m2.user, *env->sc_subaddressing_delim) == NULL) {
 			/* otherwise, strip tag from session address if any */
-			p = strchr(m1.user, '+');
+			p = strchr(m1.user, *env->sc_subaddressing_delim);
 			if (p)
 				*p = '\0';
 		}
@@ -475,7 +477,7 @@ valid_localpart(const char *s)
 {
 #define IS_ATEXT(c) (isalnum((unsigned char)(c)) || strchr(MAILADDR_ALLOWED, (c)))
 nextatom:
-	if (! IS_ATEXT(*s) || *s == '\0')
+	if (!IS_ATEXT(*s) || *s == '\0')
 		return 0;
 	while (*(++s) != '\0') {
 		if (*s == '.')
@@ -504,46 +506,30 @@ valid_domainpart(const char *s)
 			p = s + 6;
 		else
 			p = s + 1;
-	
+
 		if (strlcpy(domain, p, sizeof domain) >= sizeof domain)
 			return 0;
 
 		c = strchr(domain, (int)']');
 		if (!c || c[1] != '\0')
 			return 0;
-		
+
 		*c = '\0';
-		
+
 		if (inet_pton(AF_INET6, domain, &ina6) == 1)
 			return 1;
 		if (inet_pton(AF_INET, domain, &ina) == 1)
 			return 1;
-		
+
 		return 0;
 	}
-	
-nextsub:
-	if (!isalnum((unsigned char)*s))
+
+	if (*s == '\0')
 		return 0;
-	while (*(++s) != '\0') {
-		if (*s == '.')
-			break;
-		if (isalnum((unsigned char)*s) || *s == '-')
-			continue;
-		return 0;
-	}
-	if (s[-1] == '-')
-		return 0;
-	if (*s == '.') {
-		s++;
-		goto nextsub;
-	}
-	return 1;
+
+	return res_hnok(s);
 }
 
-/*
- * Check file for security. Based on usr.bin/ssh/auth.c.
- */
 int
 secure_file(int fd, char *path, char *userdir, uid_t uid, int mayread)
 {
@@ -561,7 +547,7 @@ secure_file(int fd, char *path, char *userdir, uid_t uid, int mayread)
 	/* Check the open file to avoid races. */
 	if (fstat(fd, &st) < 0 ||
 	    !S_ISREG(st.st_mode) ||
-	    (st.st_uid != 0 && st.st_uid != uid) ||
+	    st.st_uid != uid ||
 	    (st.st_mode & (mayread ? 022 : 066)) != 0)
 		return 0;
 
@@ -598,6 +584,7 @@ addargs(arglist *args, char *fmt, ...)
 	char *cp;
 	uint nalloc;
 	int r;
+	char	**tmp;
 
 	va_start(ap, fmt);
 	r = vasprintf(&cp, fmt, ap);
@@ -612,9 +599,10 @@ addargs(arglist *args, char *fmt, ...)
 	} else if (args->num+2 >= nalloc)
 		nalloc *= 2;
 
-	args->list = reallocarray(args->list, nalloc, sizeof(char *));
-	if (args->list == NULL)
+	tmp = reallocarray(args->list, nalloc, sizeof(char *));
+	if (tmp == NULL)
 		fatal("addargs: reallocarray");
+	args->list = tmp;
 	args->nalloc = nalloc;
 	args->list[args->num++] = cp;
 	args->list[args->num] = NULL;
@@ -660,7 +648,7 @@ xlowercase(char *buf, const char *s, size_t len)
 	if (len == 0)
 		fatalx("lowercase: len == 0");
 
-	if (! lowercase(buf, s, len))
+	if (!lowercase(buf, s, len))
 		fatalx("lowercase: truncation");
 }
 
@@ -679,33 +667,6 @@ generate_uid(void)
 		;
 
 	return (uid);
-}
-
-void
-session_socket_blockmode(int fd, enum blockmodes bm)
-{
-	int	flags;
-
-	if ((flags = fcntl(fd, F_GETFL, 0)) == -1)
-		fatal("fcntl F_GETFL");
-
-	if (bm == BM_NONBLOCK)
-		flags |= O_NONBLOCK;
-	else
-		flags &= ~O_NONBLOCK;
-
-	if ((flags = fcntl(fd, F_SETFL, flags)) == -1)
-		fatal("fcntl F_SETFL");
-}
-
-void
-session_socket_no_linger(int fd)
-{
-	struct linger	 lng;
-
-	memset(&lng, 0, sizeof(lng));
-	if (setsockopt(fd, SOL_SOCKET, SO_LINGER, &lng, sizeof(lng)) == -1)
-		fatal("session_socket_no_linger");
 }
 
 int
@@ -755,73 +716,69 @@ parse_smtp_response(char *line, size_t len, char **msg, int *cont)
 	return NULL;
 }
 
+static int
+parse_mailname_file(char *hostname, size_t len)
+{
+	FILE	*fp;
+	char	*buf = NULL;
+	size_t	 bufsz = 0;
+	ssize_t	 buflen;
+
+	if ((fp = fopen(MAILNAME_FILE, "r")) == NULL)
+		return 1;
+
+	if ((buflen = getline(&buf, &bufsz, fp)) == -1)
+		goto error;
+
+	if (buf[buflen - 1] == '\n')
+		buf[buflen - 1] = '\0';
+
+	if (strlcpy(hostname, buf, len) >= len) {
+		fprintf(stderr, MAILNAME_FILE " entry too long");
+		goto error;
+	}
+
+	return 0;
+error:
+	fclose(fp);
+	free(buf);
+	return 1;
+}
+
 int
 getmailname(char *hostname, size_t len)
 {
-	struct addrinfo	hints, *res = NULL;
-	FILE	*fp;
-	char	*buf, *lbuf = NULL;
-	size_t	 buflen;
-	int	 error, ret = 0;
+	struct addrinfo	 hints, *res = NULL;
+	int		 error;
 
-	/* First, check if we have MAILNAME_FILE */
-	if ((fp = fopen(MAILNAME_FILE, "r")) == NULL)
-		goto nomailname;
+	/* Try MAILNAME_FILE first */
+	if (parse_mailname_file(hostname, len) == 0)
+		return 0;
 
-	if ((buf = fgetln(fp, &buflen)) == NULL)
-		goto end;
-
-	if (buf[buflen-1] == '\n')
-		buf[buflen - 1] = '\0';
-	else {
-		if ((lbuf = calloc(buflen + 1, 1)) == NULL) {
-			log_warn("calloc");
-			fatal("exiting");
-		}
-		memcpy(lbuf, buf, buflen);
-	}
-
-	if (strlcpy(hostname, buf, len) >= len)
-		fprintf(stderr, MAILNAME_FILE " entry too long");
-	else {
-		ret = 1;
-		goto end;
-	}
-
-nomailname:
+	/* Next, gethostname(3) */
 	if (gethostname(hostname, len) == -1) {
-		fprintf(stderr, "invalid hostname: gethostname() failed\n");
-		goto end;
+		fprintf(stderr, "getmailname: gethostname() failed\n");
+		return -1;
 	}
 
-	if (strchr(hostname, '.') == NULL) {
-		memset(&hints, 0, sizeof hints);
-		hints.ai_family = PF_UNSPEC;
-		hints.ai_socktype = SOCK_STREAM;
-		hints.ai_protocol = IPPROTO_TCP;
-		hints.ai_flags = AI_CANONNAME;
-		error = getaddrinfo(hostname, NULL, &hints, &res);
-		if (error) {
-			fprintf(stderr, "invalid hostname: getaddrinfo() failed: %s\n",
-			    gai_strerror(error));
-			goto end;
-		}
+	if (strchr(hostname, '.') != NULL)
+		return 0;
 
-		if (strlcpy(hostname, res->ai_canonname, len) >= len) {
-			fprintf(stderr, "hostname too long");
-			goto end;
-		}
+	/* Canonicalize if domain part is missing */
+	memset(&hints, 0, sizeof hints);
+	hints.ai_family = PF_UNSPEC;
+	hints.ai_flags = AI_CANONNAME;
+	error = getaddrinfo(hostname, NULL, &hints, &res);
+	if (error)
+		return 0; /* Continue with non-canon hostname */
+
+	if (strlcpy(hostname, res->ai_canonname, len) >= len) {
+		fprintf(stderr, "hostname too long");
+		return -1;
 	}
 
-	ret = 1;
-
-end:
-	free(lbuf);
-	if (res)
-		freeaddrinfo(res);
-	if (fp)
-		fclose(fp);
-	return ret;
+	freeaddrinfo(res);
+	return 0;
 }
 
 int
@@ -835,4 +792,25 @@ int
 base64_decode(char const *src, unsigned char *dest, size_t destsize)
 {
 	return __b64_pton(src, dest, destsize);
+}
+
+void
+log_trace(int mask, const char *emsg, ...)
+{
+	va_list	 ap;
+
+	if (tracing & mask) {
+		va_start(ap, emsg);
+		vlog(LOG_DEBUG, emsg, ap);
+		va_end(ap);
+	}
+}
+
+void
+log_trace_verbose(int v)
+{
+	tracing = v;
+
+	/* Set debug logging in log.c */
+	log_setverbose(v & TRACE_DEBUG ? 2 : foreground_log);
 }

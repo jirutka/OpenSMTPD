@@ -1,4 +1,4 @@
-.\"	$OpenBSD: smtpd.8,v 1.25 2014/03/13 14:47:44 tedu Exp $
+.\"	$OpenBSD: smtpd.8,v 1.32 2017/01/03 22:11:39 jmc Exp $
 .\"
 .\" Copyright (c) 2012, Eric Faurot <eric@openbsd.org>
 .\" Copyright (c) 2008, Gilles Chehade <gilles@poolp.org>
@@ -16,7 +16,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: March 13 2014 $
+.Dd $Mdocdate: January 3 2017 $
 .Dt SMTPD 8
 .Os
 .Sh NAME
@@ -24,10 +24,11 @@
 .Nd Simple Mail Transfer Protocol daemon
 .Sh SYNOPSIS
 .Nm
-.Op Fl dnv
+.Op Fl dFhnv
 .Op Fl D Ar macro Ns = Ns Ar value
 .Op Fl f Ar file
 .Op Fl P Ar system
+.Op Fl T Ar trace
 .Sh DESCRIPTION
 .Nm
 is a Simple Mail Transfer Protocol
@@ -64,8 +65,16 @@ If this option is specified,
 .Nm
 will run in the foreground and log to
 .Em stderr .
+.It Fl F
+Do not daemonize.
+If this option is specified,
+.Nm
+will run in the foreground and log to
+.Xr syslogd 8 .
 .It Fl f Ar file
 Specify an alternative configuration file.
+.It Fl h
+Display version and usage.
 .It Fl n
 Configtest mode.
 Only check the configuration file for validity.
@@ -84,11 +93,46 @@ Do not schedule remote transfers.
 .It smtp
 Do not listen on SMTP sockets.
 .El
+.It Fl T Ar trace
+Enables real-time tracing at startup.
+Normal operation can be resumed using
+.Xr smtpctl 8 .
+This option can be used multiple times.
+The accepted values are:
+.Pp
+.Bl -bullet -compact
+.It
+imsg
+.It
+io
+.It
+smtp (incoming sessions)
+.It
+filters
+.It
+transfer (outgoing sessions)
+.It
+bounce
+.It
+scheduler
+.It
+expand (aliases/virtual/forward expansion)
+.It
+lookup (user/credentials lookups)
+.It
+stat
+.It
+rules (matched by incoming sessions)
+.It
+mproc
+.It
+all
+.El
 .It Fl v
 Produce more verbose output.
 .El
 .Sh FILES
-.Bl -tag -width "/var/run/smtpd.sockXXX" -compact
+.Bl -tag -width "/etc/mail/smtpd.confXXX" -compact
 .It Pa /etc/mail/mailname
 Alternate server name to use.
 .It Pa /etc/mail/smtpd.conf
@@ -99,8 +143,13 @@ configuration file.
 .Ux Ns -domain
 socket used for communication with
 .Xr smtpctl 8 .
+.It Pa /var/spool/smtpd/
+Spool directories for mail during processing.
+.It Pa ~/.forward
+User email forwarding information.
 .El
 .Sh SEE ALSO
+.Xr forward 5 ,
 .Xr smtpd.conf 5 ,
 .Xr mailwrapper 8 ,
 .Xr smtpctl 8

@@ -1,4 +1,4 @@
-/*	$OpenBSD: rfc2822.h,v 1.1 2014/10/12 16:19:30 gilles Exp $	*/
+/*	$OpenBSD: rfc2822.h,v 1.4 2015/11/05 08:55:09 gilles Exp $	*/
 
 /*
  * Copyright (c) 2014 Gilles Chehade <gilles@poolp.org>
@@ -19,7 +19,7 @@
 #ifndef _RFC2822_H_
 #define	_RFC2822_H_
 
-#define	RFC2822_MAX_LINE_SIZE		998
+#define	RFC2822_MAX_LINE_SIZE		4096
 
 struct rfc2822_line {
 	TAILQ_ENTRY(rfc2822_line)	next;
@@ -39,6 +39,14 @@ struct rfc2822_hdr_cb {
 	void			       *arg;
 };
 
+struct rfc2822_hdr_miss_cb {
+	TAILQ_ENTRY(rfc2822_hdr_miss_cb)	next;
+
+	char					name[RFC2822_MAX_LINE_SIZE+1];
+	void				      (*func)(const char *, void *);
+	void				       *arg;
+};
+
 struct rfc2822_line_cb {
 	void			      (*func)(const char *, void *);
 	void			       *arg;
@@ -47,7 +55,8 @@ struct rfc2822_line_cb {
 struct rfc2822_parser {
 	uint8_t					in_hdrs;	/* in headers */
 
-	TAILQ_HEAD(hdr_cb, rfc2822_hdr_cb)	hdr_cb;
+	TAILQ_HEAD(hdr_cb, rfc2822_hdr_cb)		hdr_cb;
+	TAILQ_HEAD(hdr_miss_cb, rfc2822_hdr_miss_cb)	hdr_miss_cb;
 
 	uint8_t					in_hdr;		/* in specific header */
 	struct rfc2822_header			header;
@@ -59,10 +68,13 @@ struct rfc2822_parser {
 
 void	rfc2822_parser_init(struct rfc2822_parser *);
 int	rfc2822_parser_feed(struct rfc2822_parser *, const char *);
+void	rfc2822_parser_flush(struct rfc2822_parser *);
 void	rfc2822_parser_reset(struct rfc2822_parser *);
 void	rfc2822_parser_release(struct rfc2822_parser *);
 int	rfc2822_header_callback(struct rfc2822_parser *, const char *,
     void (*)(const struct rfc2822_header *, void *), void *);
+int	rfc2822_missing_header_callback(struct rfc2822_parser *, const char *,
+    void (*)(const char *, void *), void *);
 void	rfc2822_header_default_callback(struct rfc2822_parser *,
     void (*)(const struct rfc2822_header *, void *), void *);
 void	rfc2822_body_callback(struct rfc2822_parser *,

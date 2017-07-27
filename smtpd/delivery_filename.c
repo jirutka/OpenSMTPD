@@ -1,4 +1,4 @@
-/*	$OpenBSD: delivery_filename.c,v 1.9 2013/05/24 17:03:14 eric Exp $	*/
+/*	$OpenBSD: delivery_filename.c,v 1.14 2015/12/28 19:47:57 millert Exp $	*/
 
 /*
  * Copyright (c) 2011 Gilles Chehade <gilles@poolp.org>
@@ -53,12 +53,14 @@ static void
 delivery_filename_open(struct deliver *deliver)
 {
 	struct stat	 sb;
-	size_t		 len;
+	size_t		 sz = 0;
+	ssize_t		 len;
 	int		 fd;
 	FILE		*fp;
-	char		*ln;
+	char		*ln = NULL;
 	char		*msg;
 	int		 n;
+	int		 escape_from;
 
 #define error(m)	{ msg = m; goto err; }
 #define error2(m)	{ msg = m; goto err2; }
@@ -74,15 +76,23 @@ delivery_filename_open(struct deliver *deliver)
 	fp = fdopen(fd, "a");
 	if (fp == NULL)
 		error("fdopen");
-	while ((ln = fgetln(stdin, &len)) != NULL) {
+
+	escape_from = 0;
+	while ((len = getline(&ln, &sz, stdin)) != -1) {
 		if (ln[len - 1] == '\n')
-			len--;
-		if (len >= 5 && memcmp(ln, "From ", 5) == 0)
-			putc('>', fp);
-		fprintf(fp, "%.*s\n", (int)len, ln);
+			ln[len - 1] = '\0';
+		if (strncmp(ln, "From ", 5) == 0) {
+			if (escape_from == 0)
+				escape_from = 1;
+			else
+				putc('>', fp);
+		}
+		fputs(ln, fp);
+		putc('\n', fp);
 		if (ferror(fp))
 			break;
 	}
+	free(ln);
 	if (ferror(stdin))
 		error2("read error");
 	putc('\n', fp);

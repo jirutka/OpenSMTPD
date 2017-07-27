@@ -1,4 +1,4 @@
-/*	$OpenBSD: bounce.c,v 1.64 2014/04/19 17:27:40 gilles Exp $	*/
+/*	$OpenBSD: bounce.c,v 1.77 2016/11/30 11:52:48 eric Exp $	*/
 
 /*
  * Copyright (c) 2009 Gilles Chehade <gilles@poolp.org>
@@ -80,8 +80,7 @@ struct bounce_session {
 	struct bounce_message		*msg;
 	FILE				*msgfp;
 	int				 state;
-	struct iobuf			 iobuf;
-	struct io			 io;
+	struct io			*io;
 	uint64_t			 boundary;
 };
 
@@ -97,10 +96,9 @@ static int  bounce_next_message(struct bounce_session *);
 static int  bounce_next(struct bounce_session *);
 static void bounce_delivery(struct bounce_message *, int, const char *);
 static void bounce_status(struct bounce_session *, const char *, ...);
-static void bounce_io(struct io *, int);
+static void bounce_io(struct io *, int, void *);
 static void bounce_timeout(int, short, void *);
 static void bounce_free(struct bounce_session *);
-static const char *bounce_strtype(enum bounce_type);
 static const char *action_str(const struct delivery_bounce *);
 
 static struct tree			wait_fd;
@@ -149,8 +147,20 @@ bounce_add(uint64_t evpid)
 	key.msgid = evpid_to_msgid(evpid);
 	key.bounce = evp.agent.bounce;
 	key.smtpname = evp.smtpname;
-	key.bounce.type = B_DSN;
+
+	switch (evp.esc_class) {
+	case ESC_STATUS_OK:
+		key.bounce.type = B_DSN;
+		break;
+	case ESC_STATUS_TEMPFAIL:
+		key.bounce.type = B_WARNING;
+		break;
+	default:
+		key.bounce.type = B_ERROR;
+	}
+
 	key.bounce.dsn_ret = evp.dsn_ret;
+	key.bounce.expire = evp.expire;
 	msg = SPLAY_FIND(bounce_message_tree, &messages, &key);
 	if (msg == NULL) {
 		msg = xcalloc(1, sizeof(*msg), "bounce_add");
@@ -218,10 +228,11 @@ bounce_fd(int fd)
 	s = xcalloc(1, sizeof(*s), "bounce_fd");
 	s->smtpname = xstrdup(msg->smtpname, "bounce_fd");
 	s->state = BOUNCE_EHLO;
-	iobuf_xinit(&s->iobuf, 0, 0, "bounce_run");
-	io_init(&s->io, fd, s, bounce_io, &s->iobuf);
-	io_set_timeout(&s->io, 30000);
-	io_set_read(&s->io);
+	s->io = io_new();
+	io_set_callback(s->io, bounce_io, s);
+	io_set_fd(s->io, fd);
+	io_set_timeout(s->io, 30000);
+	io_set_read(s->io);
 	s->boundary = generate_uid();
 
 	log_debug("debug: bounce: new session %p", s);
@@ -300,7 +311,7 @@ bounce_send(struct bounce_session *s, const char *fmt, ...)
 
 	log_trace(TRACE_BOUNCE, "bounce: %p: >>> %s", s, p);
 
-	iobuf_xfqueue(&s->iobuf, "bounce_send", "%s\n", p);
+	io_xprintf(s->io, "%s\n", p);
 
 	free(p);
 }
@@ -312,28 +323,28 @@ bounce_duration(long long int d)
 
 	if (d < 60) {
 		(void)snprintf(buf, sizeof buf, "%lld second%s", d,
-		    (d == 1)?"":"s");
+		    (d == 1) ? "" : "s");
 	} else if (d < 3600) {
 		d = d / 60;
 		(void)snprintf(buf, sizeof buf, "%lld minute%s", d,
-		    (d == 1)?"":"s");
+		    (d == 1) ? "" : "s");
 	}
 	else if (d < 3600 * 24) {
 		d = d / 3600;
 		(void)snprintf(buf, sizeof buf, "%lld hour%s", d,
-		    (d == 1)?"":"s");
+		    (d == 1) ? "" : "s");
 	}
 	else {
 		d = d / (3600 * 24);
 		(void)snprintf(buf, sizeof buf, "%lld day%s", d,
-		    (d == 1)?"":"s");
+		    (d == 1) ? "" : "s");
 	}
 	return (buf);
 }
 
 #define NOTICE_INTRO							    \
 	"    Hi!\n\n"							    \
-	"    This is the MAILER-DAEMON, please DO NOT REPLY to this e-mail.\n"
+	"    This is the MAILER-DAEMON, please DO NOT REPLY to this email.\n"
 
 const char *notice_error =
     "    An error has occurred while attempting to deliver a message for\n"
@@ -382,7 +393,7 @@ bounce_next_message(struct bounce_session *s)
 	if ((fd = queue_message_fd_r(msg->msgid)) == -1) {
 		bounce_delivery(msg, IMSG_QUEUE_DELIVERY_TEMPFAIL,
 		    "Could not open message fd");
-		goto again;		
+		goto again;
 	}
 
 	if ((s->msgfp = fdopen(fd, "r")) == NULL) {
@@ -401,8 +412,9 @@ static int
 bounce_next(struct bounce_session *s)
 {
 	struct bounce_envelope	*evp;
-	char			*line;
-	size_t			 len, n;
+	char			*line = NULL;
+	size_t			 n, sz = 0;
+	ssize_t			 len;
 
 	switch (s->state) {
 	case BOUNCE_EHLO:
@@ -417,7 +429,7 @@ bounce_next(struct bounce_session *s)
 			log_debug("debug: bounce: %p: no more messages", s);
 			bounce_send(s, "QUIT");
 			s->state = BOUNCE_CLOSE;
- 			break;
+			break;
 		}
 		log_debug("debug: bounce: %p: found message %08"PRIx32,
 		    s, s->msg->msgid);
@@ -438,20 +450,25 @@ bounce_next(struct bounce_session *s)
 	case BOUNCE_DATA_NOTICE:
 		/* Construct an appropriate notice. */
 
-		iobuf_xfqueue(&s->iobuf, "bounce_next: HEADER",
+		io_xprintf(s->io,
 		    "Subject: Delivery status notification: %s\n"
 		    "From: Mailer Daemon <MAILER-DAEMON@%s>\n"
 		    "To: %s\n"
 		    "Date: %s\n"
+		    "MIME-Version: 1.0\n"
+		    "Content-Type: multipart/mixed;"
+		    "boundary=\"%16" PRIu64 "/%s\"\n"
 		    "\n"
 		    "This is a MIME-encapsulated message.\n"
 		    "\n",
-		    bounce_strtype(s->msg->bounce.type),
+		    action_str(&s->msg->bounce),
 		    s->smtpname,
 		    s->msg->to,
-		    time_to_text(time(NULL)));
+		    time_to_text(time(NULL)),
+		    s->boundary,
+		    s->smtpname);
 
-		iobuf_xfqueue(&s->iobuf, "bounce_next: BODY",
+		io_xprintf(s->io,
 		    "--%16" PRIu64 "/%s\n"
 		    "Content-Description: Notification\n"
 		    "Content-Type: text/plain; charset=us-ascii\n"
@@ -462,17 +479,14 @@ bounce_next(struct bounce_session *s)
 
 		switch (s->msg->bounce.type) {
 		case B_ERROR:
-			iobuf_xfqueue(&s->iobuf, "bounce_next: BODY",
-			    notice_error);
+			io_xprint(s->io, notice_error);
 			break;
 		case B_WARNING:
-			iobuf_xfqueue(&s->iobuf, "bounce_next: BODY",
-			    notice_warning,
+			io_xprintf(s->io, notice_warning,
 			    bounce_duration(s->msg->bounce.delay));
 			break;
 		case B_DSN:
-			iobuf_xfqueue(&s->iobuf, "bounce_next: BODY",
-			    s->msg->bounce.mta_without_dsn ?
+			io_xprint(s->io, s->msg->bounce.mta_without_dsn ?
 			    notice_relay : notice_success);
 			break;
 		default:
@@ -480,84 +494,78 @@ bounce_next(struct bounce_session *s)
 		}
 
 		TAILQ_FOREACH(evp, &s->msg->envelopes, entry) {
-			iobuf_xfqueue(&s->iobuf,
-			    "bounce_next: DATA_NOTICE",
-			    "%s", evp->report);
+			io_xprint(s->io, evp->report);
 		}
-		iobuf_xfqueue(&s->iobuf, "bounce_next: DATA_NOTICE", "\n");
+		io_xprint(s->io, "\n");
 
 		if (s->msg->bounce.type == B_WARNING)
-			iobuf_xfqueue(&s->iobuf, "bounce_next: BODY",
-			    notice_warning2,
+			io_xprintf(s->io, notice_warning2,
 			    bounce_duration(s->msg->bounce.expire));
 
-		iobuf_xfqueue(&s->iobuf, "bounce_next: DATA_NOTICE",
+		io_xprintf(s->io,
 		    "    Below is a copy of the original message:\n"
 		    "\n");
 
-		iobuf_xfqueue(&s->iobuf, "bounce_next: BODY",
+		io_xprintf(s->io,
 		    "--%16" PRIu64 "/%s\n"
 		    "Content-Description: Delivery Report\n"
 		    "Content-Type: message/delivery-status\n"
 		    "\n",
 		    s->boundary, s->smtpname);
 
-		iobuf_xfqueue(&s->iobuf, "bounce_next: BODY",
-	    	    "Reporting-MTA: dns; %s\n"
-	    	    "Arrival-Date: %s\n"
+		io_xprintf(s->io,
+		    "Reporting-MTA: dns; %s\n"
 		    "\n",
-	    	    s->smtpname,
-	    	    time_to_text(time(NULL)));
+		    s->smtpname);
 
 		TAILQ_FOREACH(evp, &s->msg->envelopes, entry) {
-			iobuf_xfqueue(&s->iobuf, "bounce_next: BODY",
-	    	    	    "Final-Recipient: rfc822; %s@%s\n"
+			io_xprintf(s->io,
+			    "Final-Recipient: rfc822; %s@%s\n"
 			    "Action: %s\n"
-	    	    	    "Status: %s\n"
-	    	    	    "Diagnostic-Code: smtp; %s\n"
-	    	    	    "\n",
+			    "Status: %s\n"
+			    "\n",
 			    evp->dest.user,
 			    evp->dest.domain,
 			    action_str(&s->msg->bounce),
-	    	    	    esc_code(evp->esc_class, evp->esc_code),
-	    	    	    esc_description(evp->esc_code));
+			    esc_code(evp->esc_class, evp->esc_code));
 		}
 
 		log_trace(TRACE_BOUNCE, "bounce: %p: >>> [... %zu bytes ...]",
-		    s, iobuf_queued(&s->iobuf));
+		    s, io_queued(s->io));
 
 		s->state = BOUNCE_DATA_MESSAGE;
 		break;
 
 	case BOUNCE_DATA_MESSAGE:
-		iobuf_xfqueue(&s->iobuf, "bounce_next: BODY",
+		io_xprintf(s->io,
 		    "--%16" PRIu64 "/%s\n"
-	    	    "Content-Type: message/rfc822\n"
-	    	    "\n",
-	    	    s->boundary, s->smtpname);
+		    "Content-Description: Message headers\n"
+		    "Content-Type: text/rfc822-headers\n"
+		    "\n",
+		    s->boundary, s->smtpname);
 
-		n = iobuf_queued(&s->iobuf);
-		while (iobuf_queued(&s->iobuf) < BOUNCE_HIWAT) {
-			line = fgetln(s->msgfp, &len);
-			if (line == NULL)
+		n = io_queued(s->io);
+		while (io_queued(s->io) < BOUNCE_HIWAT) {
+			if ((len = getline(&line, &sz, s->msgfp)) == -1)
 				break;
 			if (len == 1 && line[0] == '\n' && /* end of headers */
 			    s->msg->bounce.type == B_DSN &&
 			    s->msg->bounce.dsn_ret ==  DSN_RETHDRS) {
+				free(line);
 				fclose(s->msgfp);
 				s->msgfp = NULL;
-				iobuf_xfqueue(&s->iobuf, "bounce_next: BODY",
-	    	    		    "\n--%16" PRIu64 "/%s--\n", s->boundary,
+				io_xprintf(s->io,
+				    "\n--%16" PRIu64 "/%s--\n", s->boundary,
 				    s->smtpname);
 				bounce_send(s, ".");
 				s->state = BOUNCE_DATA_END;
 				return (0);
 			}
 			line[len - 1] = '\0';
-			iobuf_xfqueue(&s->iobuf,
-			    "bounce_next: DATA_MESSAGE", "%s%s\n",
+			io_xprintf(s->io, "%s%s\n",
 			    (len == 2 && line[0] == '.') ? "." : "", line);
 		}
+		free(line);
 
 		if (ferror(s->msgfp)) {
 			fclose(s->msgfp);
@@ -568,11 +576,11 @@ bounce_next(struct bounce_session *s)
 			return (-1);
 		}
 
-		iobuf_xfqueue(&s->iobuf, "bounce_next: BODY",
-	    	    "\n--%16" PRIu64 "/%s--\n", s->boundary, s->smtpname);
+		io_xprintf(s->io,
+		    "\n--%16" PRIu64 "/%s--\n", s->boundary, s->smtpname);
 
 		log_trace(TRACE_BOUNCE, "bounce: %p: >>> [... %zu bytes ...]",
-		    s, iobuf_queued(&s->iobuf) - n);
+		    s, io_queued(s->io) - n);
 
 		if (feof(s->msgfp)) {
 			fclose(s->msgfp);
@@ -685,8 +693,7 @@ bounce_free(struct bounce_session *s)
 {
 	log_debug("debug: bounce: %p: deleting session", s);
 
-	iobuf_clear(&s->iobuf);
-	io_clear(&s->io);
+	io_free(s->io);
 
 	free(s->smtpname);
 	free(s);
@@ -697,9 +704,9 @@ bounce_free(struct bounce_session *s)
 }
 
 static void
-bounce_io(struct io *io, int evt)
+bounce_io(struct io *io, int evt, void *arg)
 {
-	struct bounce_session	*s = io->arg;
+	struct bounce_session	*s = arg;
 	const char		*error;
 	char			*line, *msg;
 	int			 cont;
@@ -711,17 +718,15 @@ bounce_io(struct io *io, int evt)
 	switch (evt) {
 	case IO_DATAIN:
 	    nextline:
-		line = iobuf_getline(&s->iobuf, &len);
-		if (line == NULL && iobuf_len(&s->iobuf) >= LINE_MAX) {
+		line = io_getline(s->io, &len);
+		if (line == NULL && io_datalen(s->io) >= LINE_MAX) {
 			bounce_status(s, "Input too long");
 			bounce_free(s);
 			return;
 		}
 
-		if (line == NULL) {
-			iobuf_normalize(&s->iobuf);
+		if (line == NULL)
 			break;
-		}
 
 		log_trace(TRACE_BOUNCE, "bounce: %p: <<< %s", s, line);
 
@@ -759,7 +764,7 @@ bounce_io(struct io *io, int evt)
 				bounce_free(s);
 				return;
 			}
-		if (iobuf_queued(&s->iobuf) == 0)
+		if (io_queued(s->io) == 0)
 			io_set_read(io);
 		break;
 
@@ -791,30 +796,14 @@ action_str(const struct delivery_bounce *b)
 {
 	switch (b->type) {
 	case B_ERROR:
-		return ("failed");
+		return ("error");
 	case B_WARNING:
 		return ("delayed");
 	case B_DSN:
 		if (b->mta_without_dsn)
 			return ("relayed");
-		
-		return ("delivered");
-	default:
-		log_warn("warn: bounce: unknown bounce_type");
-		return ("");
-	}
-}
 
-static const char *
-bounce_strtype(enum bounce_type t)
-{
-	switch (t) {
-	case B_ERROR:
-		return ("error");
-	case B_WARNING:
-		return ("warning");
-	case B_DSN:
-		return ("dsn");
+		return ("success");
 	default:
 		log_warn("warn: bounce: unknown bounce_type");
 		return ("");

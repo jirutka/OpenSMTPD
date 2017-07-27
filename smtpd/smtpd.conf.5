@@ -1,4 +1,4 @@
-.\"	$OpenBSD: smtpd.conf.5,v 1.118 2014/05/15 19:36:45 jmc Exp $
+.\"	$OpenBSD: smtpd.conf.5,v 1.169 2017/05/24 13:26:03 jmc Exp $
 .\"
 .\" Copyright (c) 2008 Janne Johansson <jj@openbsd.org>
 .\" Copyright (c) 2009 Jacek Masiulaniec <jacekm@dobremiasto.net>
@@ -17,7 +17,7 @@
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
 .\"
-.Dd $Mdocdate: May 15 2014 $
+.Dd $Mdocdate: May 24 2017 $
 .Dt SMTPD.CONF 5
 .Os
 .Sh NAME
@@ -74,7 +74,7 @@ accepts and rejects messages
 based on information gathered during the SMTP session.
 .Pp
 For each message processed by the daemon,
-the filter rules are evaluated in sequential order,
+the rules are evaluated in sequential order,
 from first to last.
 The first matching rule decides what action is taken.
 If no rule matches the message,
@@ -82,18 +82,25 @@ the default action is to reject the message.
 An exclamation mark may be specified to perform a reverse match.
 .Pp
 Following the accept/reject
-decision comes the optional tag matching:
+decision comes the matching of optional session related properties:
 .Bl -tag -width Ds
+.It Xo
+.Op Ic \&!
+.Ic authenticated
+.Xc
+If specified, the rule will only be matched if the client session was
+authenticated either by requesting authentication over the network or
+because the message was submitted over the local enqueuer.
 .It Xo
 .Ic tagged
 .Op Ic \&!
-.Ic tag
+.Ar tag
 .Xc
 If specified, the rule will only be matched if the client session was tagged with
 .Ar tag .
 .El
 .Pp
-After that the client's IP address filter is specified:
+After that the client's IP address rule is specified:
 .Bl -tag -width Ds
 .It Ic from any
 Make the rule match regardless of the IP of connecting client.
@@ -116,7 +123,7 @@ is declared in the table
 .Ar table .
 .El
 .Pp
-In addition, finer filtering may be achieved on the sender if desired:
+In addition, finer access control may be achieved on the sender if desired:
 .Bl -tag -width Ds
 .It Xo
 .Ic sender
@@ -127,7 +134,8 @@ If specified, the rule will only be matched if the sender email address
 is found in the table
 .Ar senders .
 The table may contain complete email addresses or apply to an entire
-domain if prefixed with @.
+domain if prefixed with
+.Sq @ .
 .El
 .Pp
 Next comes the selection based on the domain the message is sent to:
@@ -201,7 +209,7 @@ holds a key-value mapping of virtual to system users.
 For an example of how to configure the
 .Ar users
 table, see
-.Xr makemap 8 .
+.Xr table 5 .
 .It Xo
 .Ic for
 .Op Ic \&!
@@ -218,7 +226,7 @@ holds a key-value mapping of virtual to system users.
 For an example of how to configure the
 .Ar users
 table, see
-.Xr makemap 8 .
+.Xr table 5 .
 .It Xo
 .Ic for
 .Op Ic \&!
@@ -227,12 +235,19 @@ table, see
 .Xc
 This rule applies to mail destined to
 .Dq localhost
-and to the default server name.
-See the
+and to the default server name
+(the
 .Sx FILES
 entry for
 .Pa /etc/mail/mailname
-below for details of how the server name is determined.
+details how the server name is determined).
+This is the default,
+and may be omitted.
+.Pp
+If specified, the table
+.Ar aliases
+is used for looking up alternative destinations for addresses in these
+.Ar domains .
 .It Xo
 .Ic for
 .Op Ic \&!
@@ -247,7 +262,7 @@ The
 table will be used as the virtual domain mapping.
 .El
 .Pp
-Further filtering may be achieved on specific recipients if desired:
+Further access control may be achieved on specific recipients if desired:
 .Bl -tag -width Ds
 .It Xo
 .Ic recipient
@@ -275,9 +290,9 @@ function.
 .Pp
 You can also accept mail just to have it forwarded elsewhere:
 .Bl -tag -width Ds
-.It forward-only
+.It Ic forward-only
 Mail is accepted for local recipients ONLY if it is redirected to an
-external address via an alias or a ~/.forward.
+external address via an alias or a ~/.forward file.
 .Pp
 Example:
 .Bd -literal -offset indent
@@ -287,14 +302,25 @@ accept for domain opensmtpd.org forward-only
 .Pp
 Finally, the method of delivery is specified:
 .Bl -tag -width Ds
-.It Ic deliver to lmtp Op Ar host : Ns Ar port | socket
+.It Xo
+.Ic deliver to lmtp
+.Op Ar host : Ns Ar port | socket
+.Op Ic rcpt-to
+.Op Ic as Ar user
+.Xc
 Mail is delivered to
 .Ar host : Ns Ar port ,
 or to the
 .Ux
 .Ar socket
-over LMTP.
-.It Ic deliver to maildir Ar path
+over LMTP with the privileges of the specified
+.Ar user .
+.Pp
+Optionally,
+.Ic rcpt-to
+might be specified to use the recipient email address (after expansion) instead
+of the local user in the LMTP session as RCPT TO.
+.It Ic deliver to maildir Op Ar path
 Mail is added to a maildir.
 Its location,
 .Ar path ,
@@ -308,10 +334,12 @@ is assumed.
 .It Ic deliver to mbox
 Mail is delivered to the local user's system mailbox in
 .Pa /var/mail .
-.It Ic deliver to mda Ar program
+.It Ic deliver to mda Ar program Op Ic as Ar user
 Mail is piped to the specified
 .Ar program ,
-which is run with the privileges of the user the message is destined to.
+which is run with the privileges of the specified
+.Ar user
+or the user the message is destined to.
 This parameter may use conversion specifiers that are expanded before use
 .Pq see Sx FORMAT SPECIFIERS .
 .It Xo
@@ -323,7 +351,7 @@ This parameter may use conversion specifiers that are expanded before use
 .Op Ic hostname Ar name
 .Op Ic hostnames No < Ns Ar names Ns >
 .Op Ic pki Ar pkiname
-.Op Ic tls | verify
+.Op Ic tls Op Ic verify
 .Ek
 .Xc
 .Pp
@@ -351,8 +379,8 @@ in the SMTP session.
 may be a user, a domain prefixed with
 .Sq @ ,
 or an email address, causing
-smtpd to rewrite the user-part, the domain-part, or the entire address,
-respectively.
+.Xr smtpd 8
+to rewrite the user-part, the domain-part, or the entire address, respectively.
 .Pp
 If the
 .Ic source
@@ -389,9 +417,10 @@ and
 .Ic hostnames
 parameters are mutually exclusive.
 .Pp
-When relaying, STARTTLS is always attempted if available on remote host
-and OpenSMTPD will try to present a certificate matching the outgoing
-hostname if one is registered in the pki.
+When relaying, STARTTLS is always attempted if available on remote host and
+.Xr smtpd 8
+will try to present a certificate matching the outgoing hostname if one is
+registered in the pki.
 If
 .Ic pki
 is specified, the certificate registered for
@@ -400,19 +429,21 @@ is used instead.
 .Pp
 If
 .Ic tls
-is specified, OpenSMTPD will refuse to relay unless the remote host provides
-STARTTLS.
-.Pp
+is specified,
+.Xr smtpd 8
+will refuse to relay unless the remote host provides STARTTLS.
 If
-.Ic verify
-is specified, OpenSMTPD will refuse to relay unless the remote host provides
-STARTTLS and the certificate it presented has been verified.
+.Ic tls verify
+is specified,
+.Xr smtpd 8
+will refuse to relay unless the remote host provides STARTTLS and the
+certificate it presented has been verified.
 .Pp
 Note that the
 .Ic tls
 and
-.Ic verify
-options are mutually exclusive and should only be used in private networks
+.Ic tls verify
+options should only be used in private networks
 as they will prevent proper relaying on the Internet.
 .It Xo
 .Ic relay via
@@ -452,10 +483,10 @@ In addition, credentials for authenticated relaying may be provided
 when using a secure schema.
 For example:
 .Bd -literal -offset indent
-tls+auth://label@mx.example.org		# over TLS
-smtps+auth://label@mx.example.org	# over SMTPS
-secure+auth://label@mx.example.org	# over either \e
-					# SMTPS or TLS
+tls+auth://label@mx.example.org	    # over TLS
+smtps+auth://label@mx.example.org   # over SMTPS
+secure+auth://label@mx.example.org  # over either \e
+				    # SMTPS or TLS
 .Ed
 .Pp
 If a pki entry exists for the outgoing hostname, or one is provided
@@ -482,8 +513,8 @@ in the SMTP session.
 may be a user, a domain prefixed with
 .Sq @ ,
 or an email address, causing
-smtpd to rewrite the user-part, the domain-part, or the entire address,
-respectively.
+.Xr smtpd 8
+to rewrite the user-part, the domain-part, or the entire address, respectively.
 .Pp
 If the
 .Ic source
@@ -519,15 +550,17 @@ The
 and
 .Ic hostnames
 parameters are mutually exclusive.
-.El
 .Pp
 If
 .Ic verify
-is specified, OpenSMTPD will refuse to relay unless the remote host provides
-STARTTLS and the certificate it presented has been verified.
+is specified,
+.Xr smtpd 8
+will refuse to relay unless the remote host provides STARTTLS and the
+certificate it presented has been verified.
 The relay URL must specify TLS for this option to be valid.
+.El
 .Pp
-Additional per-rule adjustments available:
+Additional per-rule adjustments are available:
 .Bl -tag -width Ds
 .It Xo
 .Ic expire
@@ -558,19 +591,17 @@ bounce-warn	1h, 6h, 2d
 will generate a failure report when an envelope is in the queue for more
 than one hour, six hours and two days.
 The default is 4h.
-.It Xo
-.Ic ciphers Ar cipher-list
-.Xc
-Specify an alternate ciphers list to use when establishing TLS sessions.
-It is highly recommanded to avoid making use of this option unless there
+.It Ic ca Ar hostname Ic certificate Ar cafile
+Associate a custom CA certificate located in
+.Ar cafile
+with
+.Ar hostname .
+.It Ic ciphers Ar cipher-list
+Specify an alternate list of ciphers to use when establishing TLS sessions.
+It is highly recommended to avoid making use of this option unless there
 is a good understanding of the implications.
 .Pp
 When not specified, only ciphers considered safe are chosen.
-.It Xo
-.Ic curve Ar curve-name
-.Xc
-Specify an alternate curve for ECDHE-based cipher suites.
-If no curve is specified, the default curve prime256v1 will be used.
 .It Xo
 .Ic expire
 .Sm off
@@ -579,7 +610,7 @@ If no curve is specified, the default curve prime256v1 will be used.
 .Sm on
 .Xc
 Specify how long a message can stay in the queue.
-The default value is 4 days.
+The default value is 4d.
 For example:
 .Bd -literal -offset indent
 expire 4d	# expire after 4 days
@@ -592,8 +623,9 @@ expire 10h	# expire after 10 hours
 .Xc
 Instruct
 .Xr smtpd 8
-to accept a maximum number of recipients or emails at once in the
-receiving queue. Defaults are 100 for
+to accept a maximum number of recipients or emails at once
+in the receiving queue.
+Defaults are 100 for
 .Ic max-mails
 and 1000 for
 .Ic max-rcpt .
@@ -615,37 +647,58 @@ If a
 .Ar domain
 is specified, the restriction only applies when connecting
 to MXs for this domain.
-.It Xo
-.Ic limit scheduler max-inflight
-.Ar num
-.Xc
+.It Ic limit scheduler max-inflight Ar num
 Suspend the scheduling of envelopes for deliver/relay until the number
 of inflight envelopes falls below
 .Ar num .
-Changing the default value might degrade performances.
+Changing the default value might degrade performance.
 .It Xo
+.Ic listen on socket
+.Op Ic mask-source
+.br
 .Bk -words
 .Ic listen on Ar interface
 .Op Ar family
 .Op Ic port Ar port
 .Op Ic tls | tls-require | tls-require verify | smtps | secure
 .Op Ic pki Ar pkiname
+.Op Ic ca Ar caname
 .Op Ic auth | auth-optional Op < Ns Ar authtable Ns >
 .Op Ic tag Ar tag
 .Op Ic hostname Ar hostname
 .Op Ic hostnames No < Ns Ar names Ns >
+.Op Ic senders No < Ns Ar users Ns > Op masquerade
 .Op Ic mask-source
+.Op Ic received-auth
 .Op Ic no-dsn
-.Op Ic dsn-notify Ar disable
-.Op Ic dsn-ret Ar headers
 .Ek
 .Xc
 .Pp
-Specify an
+Specify a
+.Ic socket
+or an
 .Ar interface
-and
-.Ar port
-to listen on.
+to listen on for incoming connections.
+The
+.Ic listen on socket
+directive is used to modify the behavior of the listener handling
+messages submitted through the local enqueuer, for example via the
+.Xr mail 1
+utility.
+This is an optional directive: if unspecified then
+.Xr smtpd 8
+will simply listen for connections on the
+.Ic socket
+as if it was configured with no option.
+Clients connecting through the
+.Ic socket
+will always be tagged with the 'local'
+.Ic tag .
+.Pp
+To listen on a specific network interface, specify an
+.Ar interface
+and an optional
+.Ar port .
 An interface group, an IP address or a domain name may
 be used in place of
 .Ar interface .
@@ -675,13 +728,16 @@ able to establish an SMTP session.
 .Ic secure
 may be specified to provide both STARTTLS and SMTPS services.
 Host certificates may be used for these connections,
-and must be priorly declared using the pki directive.
+and must be previously declared using the pki directive.
 If
 .Ic pki
 is specified,
 a certificate matching
 .Ic name
 is searched for.
+Moreover, a previously declared
+.Ic ca
+directive may be specified to use a custom CA certificate.
 .Pp
 If the
 .Ic auth
@@ -708,7 +764,7 @@ and
 .Ic auth-optional
 accept an optional table as a parameter.
 When provided, credentials are looked up in this table.
-Credentials format is described in
+The credentials format is described in
 .Xr table 5 .
 .Pp
 If the
@@ -733,6 +789,17 @@ will use the hostname that matches the address on which the connection arrives
 if it is found in the mapping.
 .Pp
 If the
+.Ic senders
+parameter is used, then
+.Xr smtpd 8
+will look up a mapping of username to email addresses to see whether
+the authenticated user is allowed to submit mail
+as the sender that was provided in the SMTP session.
+In addition, if the masquerade option is provided,
+the From header will be rewritten
+to match the sender provided in the SMTP session.
+.Pp
+If the
 .Ic mask-source
 parameter is used, then the listener will skip the
 .Ic from
@@ -741,19 +808,15 @@ part when prepending the
 header.
 .Pp
 If the
+.Ic received-auth
+parameter is used, the
+.Dq Received
+header will display if the session was authenticated and by which local user.
+.Pp
+If the
 .Ic no-dsn
 parameter is used, DSN (Delivery Status Notification) extension will not
 be enabled.
-If the
-.Ic dsn-notify
-parameter is used with the
-.Ar disable
-argument, the listener will not generate DSN upon delivery failures.
-If the
-.Ic dsn-ret
-parameter is used with the
-.Ar headers
-argument, DSN will be generated without the content of the original message.
 .It Ic max-message-size Ar n
 Specify a maximum message size of
 .Ar n
@@ -765,6 +828,11 @@ The default maximum message size is 35MB if none is specified.
 Associate the certificate located in
 .Ar certfile
 with
+.Ar hostname .
+.Pp
+If a fallback certificate or SNI is wanted, the
+.Sq *
+wildcard may be used as
 .Ar hostname .
 .Pp
 A certificate chain may be created by appending one or many certificates,
@@ -779,22 +847,13 @@ Associate the key located in
 .Ar keyfile
 with
 .Ar hostname .
-.It Ic pki Ar hostname Ic ca Ar cafile
-Associate a custom CA certificate
-.Ar cafile
-with
+.It Ic pki Ar hostname Ic dhe Ar params
+Specify the DHE parameters to use for DHE cipher suites with
 .Ar hostname .
-.It Ic pki Ar hostname Ic dhparams Ar dhfile
-Associate the Diffie-Hellman parameters located in
-.Ar dhfile
-with
-.Ar hostname .
-.Pp
-The parameters are used for ephemeral key exchange.
-If not specified, OpenSMTPD will use safely generated builtin parameters.
-.Pp
-Creation of Diffie-Hellman parameters is documented in
-.Xr openssl 1 .
+Valid parameter values are none, legacy and auto.
+For legacy a fixed key length of 1024 bits is used, whereas for auto the key
+length is determined automatically.
+The default is none, which disables DHE cipher suites.
 .It Ic queue compression
 Enable transparent compression of envelopes and messages.
 The only supported algorithm at the moment is gzip.
@@ -832,6 +891,19 @@ utility.
 .Pp
 Queue encryption can be used with queue compression and will always
 perform compression before encryption.
+.It Ic subaddressing-delimiter Ar delimiter
+Redefine the subaddressing delimiter from the default
+.Sq +
+to
+.Ar delimiter .
+.Pp
+Any printable character valid in an email address is allowed,
+except spaces and
+.Sq @ .
+.Pp
+The first character in the user-part of an email address that matches
+.Ar delimiter
+is considered to be the subaddressing delimiter.
 .It Ic table Ar name Oo Ar type : Oc Ns Ar config
 Tables are used to provide additional configuration information for
 .Xr smtpd 8
@@ -877,7 +949,7 @@ The table is identified using table name
 the name itself is arbitrarily chosen.
 .Pp
 The table must contain at least one value and may declare many values as a
-list of comma separated strings.
+list of comma-separated strings.
 .It Ic table Ar name Brq Ar key Ns = Ns Ar value Op , Ar ...
 Tables containing static key-value mappings may be declared
 using an inlined notation.
@@ -887,7 +959,7 @@ The table is identified using table name
 the name itself is arbitrarily chosen.
 .Pp
 The table must contain at least one key-value mapping and may declare
-many mappings as a list of comma separated
+many mappings as a list of comma-separated
 .Ar key Ns = Ns Ar value
 descriptions.
 .El
@@ -949,7 +1021,7 @@ For example, with recipient
 .It %{rcpt:raw} Ta expands to Dq user+t?g@example.org
 .El
 .Sh FILES
-.Bl -tag -width "/etc/mail/smtpd.confXXX"
+.Bl -tag -width "/etc/mail/smtpd.confXXX" -compact
 .It Pa /etc/mail/smtpd.conf
 Default
 .Xr smtpd 8
@@ -983,15 +1055,16 @@ A secrets file is needed to specify a username and password:
 # chmod 640 /etc/mail/secrets
 # chown root:_smtpd /etc/mail/secrets
 # echo "label username:password" > /etc/mail/secrets
-# makemap /etc/mail/secrets
 .Ed
 .Pp
 .Nm
 would look like this:
 .Bd -literal -offset indent
+table aliases file:/etc/mail/aliases
+table secrets file:/etc/mail/secrets
+
 listen on lo0
-table aliases db:/etc/mail/aliases.db
-table secrets db:/etc/mail/secrets.db
+
 accept for local alias <aliases> deliver to mbox
 accept for any relay via tls+auth://label@smtp.example.com \e
 	auth <secrets>
@@ -1019,10 +1092,10 @@ The configuration file would look like this:
 pki mail.example.com certificate "/etc/ssl/mail.example.com.crt"
 pki mail.example.com key "/etc/ssl/private/mail.example.com.key"
 
+table aliases file:/etc/mail/aliases
+
 listen on lo0
 listen on egress tls pki mail.example.com auth
-
-table aliases db:/etc/mail/aliases.db
 
 accept for local alias <aliases> deliver to mda "/path/to/mda \-f \-"
 accept from any for domain example.com \e
@@ -1038,10 +1111,10 @@ but all outgoing mail is passed to dkimproxy_out on port 10027
 for signing.
 The signed messages are received on port 10028 and tagged for relaying.
 .Bd -literal -offset indent
+table aliases file:/etc/mail/aliases
+
 listen on lo0
 listen on lo0 port 10028 tag DKIM
-
-table aliases db:/etc/mail/aliases.db
 
 accept for local alias <aliases> deliver to mbox
 accept tagged DKIM for any relay
@@ -1056,14 +1129,14 @@ The table
 can be used to specify the IP addresses of relays that may legitimately
 originate mail with your domain as the sender.
 .Bd -literal -offset indent
+table aliases file:/etc/mail/aliases
+table other-relays file:/etc/mail/other-relays
+
 listen on lo0
 listen on egress
 
-table aliases	db:/etc/mail/aliases.db
-table other-relays "/etc/mail/other-relays"
-
 accept for local alias <aliases> deliver to mbox
-accept for local for any relay
+accept from local for any relay
 reject from ! source <other-relays> sender "@example.com" for any
 accept from any for domain example.com \e
 	alias <aliases> deliver to mbox

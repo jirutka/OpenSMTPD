@@ -1,4 +1,4 @@
-/*	$OpenBSD: delivery_maildir.c,v 1.13 2014/04/19 17:31:35 gilles Exp $	*/
+/*	$OpenBSD: delivery_maildir.c,v 1.18 2016/08/31 10:18:08 gilles Exp $	*/
 
 /*
  * Copyright (c) 2011 Gilles Chehade <gilles@poolp.org>
@@ -55,7 +55,7 @@ mailaddr_tag(const struct mailaddr *maddr, char *dest, size_t len)
 	char		*tag;
 	char		*sanitized;
 
-	if ((tag = strchr(maddr->user, TAG_CHAR))) {
+	if ((tag = strchr(maddr->user, *env->sc_subaddressing_delim))) {
 		tag++;
 		while (*tag == '.')
 			tag++;
@@ -89,11 +89,11 @@ delivery_maildir_open(struct deliver *deliver)
 	setproctitle("maildir delivery");
 
 	memset(&maddr, 0, sizeof maddr);
-	if (! text_to_mailaddr(&maddr, deliver->dest))
+	if (!text_to_mailaddr(&maddr, deliver->dest))
 		error("cannot parse destination address");
 
 	memset(tag, 0, sizeof tag);
-	if (! mailaddr_tag(&maddr, tag, sizeof tag))
+	if (!mailaddr_tag(&maddr, tag, sizeof tag))
 		error("cannot extract tag from destination address");
 
 	if (mkdirs(deliver->to, 0700) < 0 && errno != EEXIST)

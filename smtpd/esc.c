@@ -1,4 +1,4 @@
-/* $OpenBSD: esc.c,v 1.2 2014/04/19 17:32:58 gilles Exp $	 */
+/* $OpenBSD: esc.c,v 1.5 2016/09/03 22:16:39 gilles Exp $	 */
 
 /*
  * Copyright (c) 2014 Gilles Chehade <gilles@poolp.org>
@@ -72,7 +72,7 @@ static struct escode {
 	{ ESC_DELIVERY_TIME_EXPIRED,			"Delivery time expired" },
 
 	/* 5.x */
-	{ ESC_INVALID_RECIPIENT,			"Invalid Recipient" },
+	{ ESC_INVALID_RECIPIENT,			"Invalid recipient" },
 	{ ESC_INVALID_COMMAND,				"Invalid command" },
 	{ ESC_SYNTAX_ERROR,				"Syntax error" },
 	{ ESC_TOO_MANY_RECIPIENTS,			"Too many recipients" },
@@ -97,30 +97,6 @@ static struct escode {
 	{ ESC_CRYPTOGRAPHIC_ALGORITHM_NOT_SUPPORTED,	"Cryptographic algorithm not supported" },
 	{ ESC_MESSAGE_TOO_BIG_FOR_SYSTEM,		"Message integrity failure" },
 };
-
-#if 0
-struct esc_map {
-	uint8_t		code;
-	const char     *description;
-};
-
-static struct esc_map esc_class[] = {
-	{ 2, "Success" },
-	{ 4, "Persistent Transient Failure"},
-	{ 5, "Permanent Failure" },
-};
-
-static struct esc_map esc_subclass[] = {
-	{ 0, "Other/Undefined" },
-	{ 1, "Addressing Status" },
-	{ 2, "Mailbox Status" },
-	{ 3, "Mail System Status" },
-	{ 4, "Network and Routing Status" },
-	{ 5, "Mail Delivery Protocol Status" },
-	{ 6, "Message Content or Media Status" },
-	{ 7, "Security or Policy Status" },
-};
-#endif
 
 const char *
 esc_code(enum enhanced_status_class class, enum enhanced_status_code code)

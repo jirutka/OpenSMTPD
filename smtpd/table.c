@@ -1,4 +1,4 @@
-/*	$OpenBSD: table.c,v 1.16 2014/05/09 21:30:11 tedu Exp $	*/
+/*	$OpenBSD: table.c,v 1.24 2017/05/01 09:29:07 gilles Exp $	*/
 
 /*
  * Copyright (c) 2013 Eric Faurot <eric@openbsd.org>
@@ -128,7 +128,7 @@ table_lookup(struct table *table, struct dict *params, const char *key, enum tab
 	if (table->t_backend->lookup == NULL)
 		return (-1);
 
-	if (! lowercase(lkey, key, sizeof lkey)) {
+	if (!lowercase(lkey, key, sizeof lkey)) {
 		log_warnx("warn: lookup key too long: %s", key);
 		return -1;
 	}
@@ -208,10 +208,10 @@ table_create(const char *backend, const char *name, const char *tag,
 		fatalx("table_create: table \"%s\" already defined", name);
 
 	if ((tb = table_backend_lookup(backend)) == NULL) {
-		if ((size_t)snprintf(path, sizeof(path), PATH_LIBEXEC "/table-%s",
-		    backend) >= sizeof(path)) {
+		if ((size_t)snprintf(path, sizeof(path), PATH_LIBEXEC"/table-%s",
+			backend) >= sizeof(path)) {
 			fatalx("table_create: path too long \""
-			    PATH_LIBEXEC "/table-%s\"", backend);
+			    PATH_LIBEXEC"/table-%s\"", backend);
 		}
 		if (stat(path, &sb) == 0) {
 			tb = table_backend_lookup("proc");
@@ -292,7 +292,7 @@ table_add(struct table *t, const char *key, const char *val)
 	if (t->t_type & T_DYNAMIC)
 		fatalx("table_add: cannot add to table");
 
-	if (! lowercase(lkey, key, sizeof lkey)) {
+	if (!lowercase(lkey, key, sizeof lkey)) {
 		log_warnx("warn: lookup key too long: %s", key);
 		return;
 	}
@@ -368,9 +368,9 @@ table_mailaddr_match(const char *s1, const char *s2)
 	struct mailaddr m1;
 	struct mailaddr m2;
 
-	if (! text_to_mailaddr(&m1, s1))
+	if (!text_to_mailaddr(&m1, s1))
 		return 0;
-	if (! text_to_mailaddr(&m2, s2))
+	if (!text_to_mailaddr(&m2, s2))
 		return 0;
 	return mailaddr_match(&m1, &m2);
 }
@@ -387,9 +387,9 @@ table_netaddr_match(const char *s1, const char *s2)
 
 	if (strcasecmp(s1, s2) == 0)
 		return 1;
-	if (! text_to_netaddr(&n1, s1))
+	if (!text_to_netaddr(&n1, s1))
 		return 0;
-	if (! text_to_netaddr(&n2, s2))
+	if (!text_to_netaddr(&n2, s2))
 		return 0;
 	if (n1.ss.ss_family != n2.ss.ss_family)
 		return 0;
@@ -504,7 +504,7 @@ table_open_all(void)
 
 	iter = NULL;
 	while (dict_iter(env->sc_tables_dict, &iter, NULL, (void **)&t))
-		if (! table_open(t))
+		if (!table_open(t))
 			fatalx("failed to open table %s", t->t_name);
 }
 
@@ -606,12 +606,12 @@ table_parse_lookup(enum table_service service, const char *key,
 		if (lk->maddrmap == NULL)
 			return (-1);
 		maddrmap_init(lk->maddrmap);
-		if (! mailaddr_line(lk->maddrmap, line)) {
+		if (!mailaddr_line(lk->maddrmap, line)) {
 			maddrmap_free(lk->maddrmap);
 			return (-1);
 		}
 		return (1);
-		
+
 	case K_ADDRNAME:
 		if (parse_sockaddr((struct sockaddr *)&lk->addrname.addr,
 		    PF_UNSPEC, key) == -1)
@@ -694,6 +694,7 @@ table_dump_lookup(enum table_service s, union lookup *lk)
 		break;
 
 	default:
+		(void)strlcpy(buf, "???", sizeof(buf));
 		break;
 	}
 

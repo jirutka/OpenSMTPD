@@ -1,5 +1,5 @@
-/*	$OpenBSD$	*/
-/*      
+/*	$OpenBSD: iobuf.c,v 1.10 2017/03/17 20:56:04 eric Exp $	*/
+/*
  * Copyright (c) 2012 Eric Faurot <eric@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
@@ -53,7 +53,7 @@ iobuf_init(struct iobuf *io, size_t size, size_t max)
 	if (size > max)
 		return (-1);
 
-	if ((io->buf = malloc(size)) == NULL)
+	if ((io->buf = calloc(size, 1)) == NULL)
 		return (-1);
 
 	io->size = size;
@@ -67,8 +67,7 @@ iobuf_clear(struct iobuf *io)
 {
 	struct ioqbuf	*q;
 
-	if (io->buf)
-		free(io->buf);
+	free(io->buf);
 
 	while ((q = io->outq)) {
 		io->outq = q->next;
@@ -111,7 +110,7 @@ iobuf_extend(struct iobuf *io, size_t n)
 	if (io->max - io->size < n)
 		return (-1);
 
-	t = realloc(io->buf, io->size + n);
+	t = recallocarray(io->buf, io->size, io->size + n, 1);
 	if (t == NULL)
 		return (-1);
 
@@ -395,7 +394,7 @@ iobuf_flush_ssl(struct iobuf *io, void *ssl)
 	ssize_t	s;
 
 	while (io->queued)
-		if ((s = iobuf_write_ssl(io, ssl) < 0))
+		if ((s = iobuf_write_ssl(io, ssl)) < 0)
 			return (s);
 
 	return (0);

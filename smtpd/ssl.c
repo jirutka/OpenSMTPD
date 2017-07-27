@@ -1,4 +1,4 @@
-/*	$OpenBSD: ssl.c,v 1.69 2014/07/10 20:16:48 jsg Exp $	*/
+/*	$OpenBSD: ssl.c,v 1.89 2017/05/17 14:00:06 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2008 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -55,9 +55,9 @@ ssl_init(void)
 
 	SSL_library_init();
 	SSL_load_error_strings();
-	
+
 	OpenSSL_add_all_algorithms();
-	
+
 	/* Init hardware crypto engines. */
 	ENGINE_load_builtin_engines();
 	ENGINE_register_all_complete();
@@ -65,32 +65,29 @@ ssl_init(void)
 }
 
 int
-ssl_setup(SSL_CTX **ctxp, struct pki *pki, const char *ciphers, const char *curve)
+ssl_setup(SSL_CTX **ctxp, struct pki *pki,
+    int (*sni_cb)(SSL *,int *,void *), const char *ciphers)
 {
-	DH	*dh;
 	SSL_CTX	*ctx;
-	u_int8_t sid[SSL_MAX_SID_CTX_LENGTH];
+	uint8_t sid[SSL_MAX_SID_CTX_LENGTH];
 
 	ctx = ssl_ctx_create(pki->pki_name, pki->pki_cert, pki->pki_cert_len, ciphers);
 
-        /*
-         * Set session ID context to a random value.  We don't support
-         * persistent caching of sessions so it is OK to set a temporary
-         * session ID context that is valid during run time.
-         */
-        arc4random_buf(sid, sizeof(sid));
-        if (!SSL_CTX_set_session_id_context(ctx, sid, sizeof(sid)))
-                goto err;
+	/*
+	 * Set session ID context to a random value.  We don't support
+	 * persistent caching of sessions so it is OK to set a temporary
+	 * session ID context that is valid during run time.
+	 */
+	arc4random_buf(sid, sizeof(sid));
+	if (!SSL_CTX_set_session_id_context(ctx, sid, sizeof(sid)))
+		goto err;
 
-	if (pki->pki_dhparams_len == 0)
-		dh = get_dh1024();
-	else
-		dh = get_dh_from_memory(pki->pki_dhparams,
-		    pki->pki_dhparams_len);
-	ssl_set_ephemeral_key_exchange(ctx, dh);
-	DH_free(dh);
+	if (sni_cb)
+		SSL_CTX_set_tlsext_servername_callback(ctx, sni_cb);
 
-	ssl_set_ecdh_curve(ctx, curve);
+	SSL_CTX_set_dh_auto(ctx, pki->pki_dhe);
+
+	SSL_CTX_set_ecdh_auto(ctx, 1);
 
 	*ctxp = ctx;
 	return 1;
@@ -137,8 +134,7 @@ ssl_load_file(const char *name, off_t *len, mode_t perm)
 	return (buf);
 
 fail:
-	if (buf != NULL)
-		free(buf);
+	free(buf);
 	saved_errno = errno;
 	close(fd);
 	errno = saved_errno;
@@ -244,10 +240,8 @@ ssl_load_key(const char *name, off_t *len, char *pass, mode_t perm, const char *
 fail:
 	ssl_error("ssl_load_key");
 	free(buf);
-	if (bio != NULL)
-		BIO_free_all(bio);
-	if (key != NULL)
-		EVP_PKEY_free(key);
+	BIO_free_all(bio);
+	EVP_PKEY_free(key);
 	if (fp)
 		fclose(fp);
 	return (NULL);
@@ -256,8 +250,8 @@ fail:
 SSL_CTX *
 ssl_ctx_create(const char *pkiname, char *cert, off_t cert_len, const char *ciphers)
 {
-	SSL_CTX	       *ctx;
-	size_t		pkinamelen = 0;
+	SSL_CTX	*ctx;
+	size_t	 pkinamelen = 0;
 
 	ctx = SSL_CTX_new(SSLv23_method());
 	if (ctx == NULL) {
@@ -271,6 +265,8 @@ ssl_ctx_create(const char *pkiname, char *cert, off_t cert_len, const char *ciph
 	    SSL_OP_ALL | SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TICKET);
 	SSL_CTX_set_options(ctx,
 	    SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION);
+	SSL_CTX_set_options(ctx, SSL_OP_NO_CLIENT_RENEGOTIATION);
+	SSL_CTX_set_options(ctx, SSL_OP_CIPHER_SERVER_PREFERENCE);
 
 	if (ciphers == NULL)
 		ciphers = SSL_CIPHERS;
@@ -319,44 +315,21 @@ ssl_load_keyfile(struct pki *p, const char *pathname, const char *pkiname)
 }
 
 int
-ssl_load_cafile(struct pki *p, const char *pathname)
+ssl_load_cafile(struct ca *c, const char *pathname)
 {
-	p->pki_ca = ssl_load_file(pathname, &p->pki_ca_len, 0755);
-	if (p->pki_ca == NULL)
+	c->ca_cert = ssl_load_file(pathname, &c->ca_cert_len, 0755);
+	if (c->ca_cert == NULL)
 		return 0;
-	return 1;
-}
-
-int
-ssl_load_dhparams(struct pki *p, const char *pathname)
-{
-	p->pki_dhparams = ssl_load_file(pathname, &p->pki_dhparams_len, 0755);
-	if (p->pki_dhparams == NULL) {
-		if (errno == EACCES)
-			return 0;
-		log_info("info: No DH parameters found in %s: "
-		    "using built-in parameters", pathname);
-	}
 	return 1;
 }
 
 const char *
 ssl_to_text(const SSL *ssl)
 {
-	static char	buf[256];
-	static char	description[128];
-	char	       *tls_version = NULL;
+	static char buf[256];
 
-	/*
-	 * SSL_get_cipher_version() does not know about the exact TLS version...
-	 * you have to pick it up from second field of the SSL cipher description !
-	 */
-	SSL_CIPHER_description(SSL_get_current_cipher(ssl), description, sizeof description);
-	tls_version = strchr(description, ' ') + 1;
-	tls_version[strcspn(tls_version, " ")] = '\0';
-	(void)snprintf(buf, sizeof buf, "version=%s (%s), cipher=%s, bits=%d",
-	    SSL_get_cipher_version(ssl),
-	    tls_version,
+	(void)snprintf(buf, sizeof buf, "version=%s, cipher=%s, bits=%d",
+	    SSL_get_version(ssl),
 	    SSL_get_cipher_name(ssl),
 	    SSL_get_cipher_bits(ssl, NULL));
 
@@ -373,110 +346,6 @@ ssl_error(const char *where)
 		ERR_error_string_n(code, errbuf, sizeof(errbuf));
 		log_debug("debug: SSL library error: %s: %s", where, errbuf);
 	}
-}
-
-/* From OpenSSL's documentation:
- *
- * If "strong" primes were used to generate the DH parameters, it is
- * not strictly necessary to generate a new key for each handshake
- * but it does improve forward secrecy.
- *
- * -- gilles@
- */
-DH *
-get_dh1024(void)
-{
-	DH *dh;
-	unsigned char dh1024_p[] = {
-		0xAD,0x37,0xBB,0x26,0x75,0x01,0x27,0x75,
-		0x06,0xB5,0xE7,0x1E,0x1F,0x2B,0xBC,0x51,
-		0xC0,0xF4,0xEB,0x42,0x7A,0x2A,0x83,0x1E,
-		0xE8,0xD1,0xD8,0xCC,0x9E,0xE6,0x15,0x1D,
-		0x06,0x46,0x50,0x94,0xB9,0xEE,0xB6,0x89,
-		0xB7,0x3C,0xAC,0x07,0x5E,0x29,0x37,0xCC,
-		0x8F,0xDF,0x48,0x56,0x85,0x83,0x26,0x02,
-		0xB8,0xB6,0x63,0xAF,0x2D,0x4A,0x57,0x93,
-		0x6B,0x54,0xE1,0x8F,0x28,0x76,0x9C,0x5D,
-		0x90,0x65,0xD1,0x07,0xFE,0x5B,0x05,0x65,
-		0xDA,0xD2,0xE2,0xAF,0x23,0xCA,0x2F,0xD6,
-		0x4B,0xD2,0x04,0xFE,0xDF,0x21,0x2A,0xE1,
-		0xCD,0x1B,0x70,0x76,0xB3,0x51,0xA4,0xC9,
-		0x2B,0x68,0xE3,0xDD,0xCB,0x97,0xDA,0x59,
-		0x50,0x93,0xEE,0xDB,0xBF,0xC7,0xFA,0xA7,
-		0x47,0xC4,0x4D,0xF0,0xC6,0x09,0x4A,0x4B
-	};
-	unsigned char dh1024_g[] = {
-		0x02
-	};
-
-	if ((dh = DH_new()) == NULL)
-		return NULL;
-
-	dh->p = BN_bin2bn(dh1024_p, sizeof(dh1024_p), NULL);
-	dh->g = BN_bin2bn(dh1024_g, sizeof(dh1024_g), NULL);
-	if (dh->p == NULL || dh->g == NULL) {
-		DH_free(dh);
-		return NULL;
-	}
-
-	return dh;
-}
-
-DH *
-get_dh_from_memory(char *params, size_t len)
-{
-	BIO *mem;
-	DH *dh;
-
-	mem = BIO_new_mem_buf(params, len);
-	if (mem == NULL)
-		return NULL;
-	dh = PEM_read_bio_DHparams(mem, NULL, NULL, NULL);
-	if (dh == NULL)
-		goto err;
-	if (dh->p == NULL || dh->g == NULL)
-		goto err;
-	return dh;
-
-err:
-	if (mem != NULL)
-		BIO_free(mem);
-	if (dh != NULL)
-		DH_free(dh);
-	return NULL;
-}
-
-
-void
-ssl_set_ephemeral_key_exchange(SSL_CTX *ctx, DH *dh)
-{
-	if (dh == NULL || !SSL_CTX_set_tmp_dh(ctx, dh)) {
-		ssl_error("ssl_set_ephemeral_key_exchange");
-		fatal("ssl_set_ephemeral_key_exchange: cannot set tmp dh");
-	}
-}
-
-void
-ssl_set_ecdh_curve(SSL_CTX *ctx, const char *curve)
-{
-	int	nid;
-	EC_KEY *ecdh;
-
-	if (curve == NULL)
-		curve = SSL_ECDH_CURVE;
-	if ((nid = OBJ_sn2nid(curve)) == 0) {
-		ssl_error("ssl_set_ecdh_curve");
-		fatal("ssl_set_ecdh_curve: unknown curve name %s", curve);
-	}
-
-	if ((ecdh = EC_KEY_new_by_curve_name(nid)) == NULL) {
-		ssl_error("ssl_set_ecdh_curve");
-		fatal("ssl_set_ecdh_curve: unable to create curve %s", curve);
-	}
-
-	SSL_CTX_set_tmp_ecdh(ctx, ecdh);
-	SSL_CTX_set_options(ctx, SSL_OP_SINGLE_ECDH_USE);
-	EC_KEY_free(ecdh);
 }
 
 int
@@ -526,14 +395,11 @@ ssl_load_pkey(const void *data, size_t datalen, char *buf, off_t len,
 	return (1);
 
  fail:
-	if (rsa != NULL)
-		RSA_free(rsa);
-	if (in != NULL)
-		BIO_free(in);
-	if (pkey != NULL)
-		EVP_PKEY_free(pkey);
-	if (x509 != NULL)
-		X509_free(x509);
+	RSA_free(rsa);
+	BIO_free(in);
+	EVP_PKEY_free(pkey);
+	X509_free(x509);
+	free(exdata);
 
 	return (0);
 }
@@ -561,12 +427,12 @@ ssl_ctx_fake_private_key(SSL_CTX *ctx, const void *data, size_t datalen,
 
 	if (pkeyptr != NULL)
 		*pkeyptr = pkey;
-	else if (pkey != NULL)
+	else
 		EVP_PKEY_free(pkey);
 
 	if (x509ptr != NULL)
 		*x509ptr = x509;
-	else if (x509 != NULL)
+	else
 		X509_free(x509);
 
 	return (ret);

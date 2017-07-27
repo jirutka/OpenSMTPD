@@ -1,6 +1,7 @@
-/*	$OpenBSD: res_send.c,v 1.8 2014/03/26 18:13:15 eric Exp $	*/
+/*	$OpenBSD: smtpf_session.c,v 1.1 2017/05/22 13:40:54 gilles Exp $	*/
+
 /*
- * Copyright (c) 2012 Eric Faurot <eric@openbsd.org>
+ * Copyright (c) 2017 Gilles Chehade <gilles@poolp.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -16,46 +17,42 @@
  */
 
 #include <sys/types.h>
+#include <sys/queue.h>
+#include <sys/tree.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-#include <netdb.h>
 
-#include <asr.h>
 #include <errno.h>
-#include <resolv.h>
-#include <string.h>
-#include <stdlib.h>
+#include <imsg.h>
+#include <limits.h>
+#include <openssl/ssl.h>
+
+#include "smtpd.h"
+#include "log.h"
+
+static void smtpf_session_init(void);
+
+static void
+smtpf_session_init(void)
+{
+	static int	init = 0;
+
+	if (!init)
+		init = 1;
+}
 
 int
-res_send(const u_char *buf, int buflen, u_char *ans, int anslen)
+smtpf_session(struct listener *listener, int sock,
+    const struct sockaddr_storage *ss, const char *hostname)
 {
-	struct asr_query *as;
-	struct asr_result ar;
-	size_t len;
+	log_debug("debug: smtpf: new client on listener: %p", listener);
 
-	res_init();
+	smtpf_session_init();
 
-	if (ans == NULL || anslen <= 0) {
-		errno = EINVAL;
-		return (-1);
-	}
+	errno = EOPNOTSUPP;
+	return (-1);
+}
 
-	as = res_send_async(buf, buflen, NULL);
-	if (as == NULL)
-		return (-1); /* errno set */
-
-	asr_run_sync(as, &ar);
-
-	if (ar.ar_errno) {
-		errno = ar.ar_errno;
-		return (-1);
-	}
-
-	len = anslen;
-	if (ar.ar_datalen < len)
-		len = ar.ar_datalen;
-	memmove(ans, ar.ar_data, len);
-	free(ar.ar_data);
-
-	return (ar.ar_datalen);
+void
+smtpf_session_imsg(struct mproc *p, struct imsg *imsg)
+{
 }

@@ -1,48 +1,50 @@
-#	$OpenBSD$
+#	$OpenBSD: Makefile,v 1.44 2016/03/30 06:38:46 jmc Exp $
 
 .PATH:		${.CURDIR}/..
 
-NEED_REALLOCARRAY!=	grep -q reallocarray /usr/include/stdlib.h && echo No || echo Yes
-NEED_ERRC!=		grep -q errc /usr/include/err.h && echo No || echo Yes
-
 PROG=	smtpctl
 BINOWN=	root
+BINGRP=	_smtpq
 
-BINMODE?=555
+BINMODE?=2555
 
 BINDIR=	/usr/sbin
-MAN=	smtpctl.8
+MAN=	smtpctl.8 aliases.5 forward.5 makemap.8 newaliases.8
 
-CFLAGS+=	-g3 -ggdb -I${.CURDIR}/..
+CFLAGS+=	-fstack-protector-all
+CFLAGS+=	-I${.CURDIR}/..
 CFLAGS+=	-Wall -Wstrict-prototypes -Wmissing-prototypes
 CFLAGS+=	-Wmissing-declarations
 CFLAGS+=	-Wshadow -Wpointer-arith -Wcast-qual
-CFLAGS+=	-Wsign-compare -Wbounded
+CFLAGS+=	-Wsign-compare
+CFLAGS+=	-Werror-implicit-function-declaration
 CFLAGS+=	-DNO_IO
 
-SRCS=		enqueue.c
-SRCS+=		parser.c
-SRCS+=		log.c
-SRCS+=		envelope.c
-SRCS+=		crypto.c
-SRCS+=		queue_backend.c
-SRCS+=		queue_fs.c
-SRCS+=		smtpctl.c util.c
-SRCS+=		compress_backend.c
-SRCS+=		compress_gzip.c
-SRCS+=		to.c
-SRCS+=		expand.c
-SRCS+=		tree.c
-SRCS+=		dict.c
-
-.if ${NEED_REALLOCARRAY} == "Yes"
-CFLAGS+=	-DNEED_REALLOCARRAY
-SRCS+=		reallocarray.c
-.endif
-.if ${NEED_ERRC} == "Yes"
-CFLAGS+=	-DNEED_ERRC
-SRCS+=		errc.c
-.endif
+SRCS=	enqueue.c
+SRCS+=	parser.c
+SRCS+=	log.c
+SRCS+=	envelope.c
+SRCS+=	crypto.c
+SRCS+=	queue_backend.c
+SRCS+=	queue_fs.c
+SRCS+=	smtpctl.c
+SRCS+=	util.c
+SRCS+=	compress_backend.c
+SRCS+=	compress_gzip.c
+SRCS+=	to.c
+SRCS+=	expand.c
+SRCS+=	tree.c
+SRCS+=	dict.c
+SRCS+=	aliases.c
+SRCS+=	limit.c
+SRCS+=	makemap.c
+SRCS+=	parse.y
+SRCS+=	mailaddr.c
+SRCS+=	table.c
+SRCS+=	table_static.c
+SRCS+=	table_db.c
+SRCS+=	table_getpwnam.c
+SRCS+=	table_proc.c
 
 LDADD+=	-lutil -lz -lcrypto
 DPADD+=	${LIBUTIL} ${LIBZ} ${LIBCRYPTO}

@@ -1,4 +1,4 @@
-/*	$OpenBSD: control.c,v 1.100 2014/04/19 11:17:14 gilles Exp $	*/
+/*	$OpenBSD: control.c,v 1.118 2017/01/09 09:53:23 reyk Exp $	*/
 
 /*
  * Copyright (c) 2012 Gilles Chehade <gilles@poolp.org>
@@ -63,7 +63,6 @@ static void control_shutdown(void);
 static void control_listen(void);
 static void control_accept(int, short, void *);
 static void control_close(struct ctl_conn *);
-static void control_sig_handler(int, short, void *);
 static void control_dispatch_ext(struct mproc *, struct imsg *);
 static void control_digest_update(const char *, size_t, int);
 static void control_broadcast_verbose(int, int);
@@ -71,11 +70,13 @@ static void control_broadcast_verbose(int, int);
 static struct stat_backend *stat_backend = NULL;
 extern const char *backend_stat;
 
-static uint32_t			connid = 0;
+static uint64_t			connid = 0;
 static struct tree		ctl_conns;
+static struct tree		ctl_count;
 static struct stat_digest	digest;
 
-#define	CONTROL_FD_RESERVE	5
+#define	CONTROL_FD_RESERVE		5
+#define	CONTROL_MAXCONN_PER_CLIENT	32
 
 static void
 control_imsg(struct mproc *p, struct imsg *imsg)
@@ -86,6 +87,12 @@ control_imsg(struct mproc *p, struct imsg *imsg)
 	const char		*key;
 	const void		*data;
 	size_t			 sz;
+
+	if (imsg == NULL) {
+		if (p->proc != PROC_CLIENT)
+			control_shutdown();
+		return;
+	}
 
 	if (p->proc == PROC_PONY) {
 		switch (imsg->hdr.type) {
@@ -148,6 +155,8 @@ control_imsg(struct mproc *p, struct imsg *imsg)
 		m_get_string(&m, &key);
 		m_get_data(&m, &data, &sz);
 		m_end(&m);
+		if (sz != sizeof(val))
+			fatalx("control: IMSG_STAT_INCREMENT size mismatch");
 		memmove(&val, data, sz);
 		if (stat_backend)
 			stat_backend->increment(key, val.u.counter);
@@ -158,6 +167,8 @@ control_imsg(struct mproc *p, struct imsg *imsg)
 		m_get_string(&m, &key);
 		m_get_data(&m, &data, &sz);
 		m_end(&m);
+		if (sz != sizeof(val))
+			fatalx("control: IMSG_STAT_DECREMENT size mismatch");
 		memmove(&val, data, sz);
 		if (stat_backend)
 			stat_backend->decrement(key, val.u.counter);
@@ -168,6 +179,8 @@ control_imsg(struct mproc *p, struct imsg *imsg)
 		m_get_string(&m, &key);
 		m_get_data(&m, &data, &sz);
 		m_end(&m);
+		if (sz != sizeof(val))
+			fatalx("control: IMSG_STAT_SET size mismatch");
 		memmove(&val, data, sz);
 		if (stat_backend)
 			stat_backend->set(key, &val);
@@ -178,36 +191,23 @@ control_imsg(struct mproc *p, struct imsg *imsg)
 	    imsg_to_str(imsg->hdr.type));
 }
 
-static void
-control_sig_handler(int sig, short event, void *p)
-{
-	switch (sig) {
-	case SIGINT:
-	case SIGTERM:
-		control_shutdown();
-		break;
-	default:
-		fatalx("control_sig_handler: unexpected signal");
-	}
-}
-
 int
 control_create_socket(void)
 {
-	struct sockaddr_un	sun;
+	struct sockaddr_un	s_un;
 	int			fd;
 	mode_t			old_umask;
 
 	if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1)
 		fatal("control: socket");
 
-	memset(&sun, 0, sizeof(sun));
-	sun.sun_family = AF_UNIX;
-	if (strlcpy(sun.sun_path, SMTPD_SOCKET,
-	    sizeof(sun.sun_path)) >= sizeof(sun.sun_path))
+	memset(&s_un, 0, sizeof(s_un));
+	s_un.sun_family = AF_UNIX;
+	if (strlcpy(s_un.sun_path, SMTPD_SOCKET,
+	    sizeof(s_un.sun_path)) >= sizeof(s_un.sun_path))
 		fatal("control: socket name too long");
 
-	if (connect(fd, (struct sockaddr *)&sun, sizeof(sun)) == 0)
+	if (connect(fd, (struct sockaddr *)&s_un, sizeof(s_un)) == 0)
 		fatalx("control socket already listening");
 
 	if (unlink(SMTPD_SOCKET) == -1)
@@ -215,7 +215,7 @@ control_create_socket(void)
 			fatal("control: cannot unlink socket");
 
 	old_umask = umask(S_IXUSR|S_IXGRP|S_IWOTH|S_IROTH|S_IXOTH);
-	if (bind(fd, (struct sockaddr *)&sun, sizeof(sun)) == -1) {
+	if (bind(fd, (struct sockaddr *)&s_un, sizeof(s_un)) == -1) {
 		(void)umask(old_umask);
 		fatal("control: bind");
 	}
@@ -227,29 +227,16 @@ control_create_socket(void)
 		fatal("control: chmod");
 	}
 
-	session_socket_blockmode(fd, BM_NONBLOCK);
+	io_set_nonblocking(fd);
 	control_state.fd = fd;
 
 	return fd;
 }
 
-pid_t
+int
 control(void)
 {
-	pid_t			 pid;
 	struct passwd		*pw;
-	struct event		 ev_sigint;
-	struct event		 ev_sigterm;
-
-	switch (pid = fork()) {
-	case -1:
-		fatal("control: cannot fork");
-	case 0:
-		post_fork(PROC_CONTROL);
-		break;
-	default:
-		return (pid);
-	}
 
 	purge_config(PURGE_EVERYTHING);
 
@@ -274,14 +261,13 @@ control(void)
 	imsg_callback = control_imsg;
 	event_init();
 
-	signal_set(&ev_sigint, SIGINT, control_sig_handler, NULL);
-	signal_set(&ev_sigterm, SIGTERM, control_sig_handler, NULL);
-	signal_add(&ev_sigint, NULL);
-	signal_add(&ev_sigterm, NULL);
+	signal(SIGINT, SIG_IGN);
+	signal(SIGTERM, SIG_IGN);
 	signal(SIGPIPE, SIG_IGN);
 	signal(SIGHUP, SIG_IGN);
 
 	tree_init(&ctl_conns);
+	tree_init(&ctl_count);
 
 	memset(&digest, 0, sizeof digest);
 	digest.startup = time(NULL);
@@ -292,13 +278,14 @@ control(void)
 	config_peer(PROC_LKA);
 	config_peer(PROC_PONY);
 	config_peer(PROC_CA);
-	config_done();
 
 	control_listen();
 
-	if (event_dispatch() < 0)
-		fatal("event_dispatch");
-	control_shutdown();
+	if (pledge("stdio unix recvfd sendfd", NULL) == -1)
+		err(1, "pledge");
+
+	event_dispatch();
+	fatalx("exited event loop");
 
 	return (0);
 }
@@ -306,8 +293,7 @@ control(void)
 static void
 control_shutdown(void)
 {
-	log_info("info: control process exiting");
-	unlink(SMTPD_SOCKET);
+	log_debug("debug: control agent exiting");
 	_exit(0);
 }
 
@@ -328,14 +314,17 @@ control_accept(int listenfd, short event, void *arg)
 {
 	int			 connfd;
 	socklen_t		 len;
-	struct sockaddr_un	 sun;
+	struct sockaddr_un	 s_un;
 	struct ctl_conn		*c;
+	size_t			*count;
+	uid_t			 euid;
+	gid_t			 egid;
 
 	if (getdtablesize() - getdtablecount() < CONTROL_FD_RESERVE)
 		goto pause;
 
-	len = sizeof(sun);
-	if ((connfd = accept(listenfd, (struct sockaddr *)&sun, &len)) == -1) {
+	len = sizeof(s_un);
+	if ((connfd = accept(listenfd, (struct sockaddr *)&s_un, &len)) == -1) {
 		if (errno == ENFILE || errno == EMFILE)
 			goto pause;
 		if (errno == EINTR || errno == EWOULDBLOCK ||
@@ -344,12 +333,33 @@ control_accept(int listenfd, short event, void *arg)
 		fatal("control_accept: accept");
 	}
 
-	session_socket_blockmode(connfd, BM_NONBLOCK);
+	io_set_nonblocking(connfd);
+
+	if (getpeereid(connfd, &euid, &egid) == -1)
+		fatal("getpeereid");
+
+	count = tree_get(&ctl_count, euid);
+	if (count == NULL) {
+		count = xcalloc(1, sizeof *count, "control_accept");
+		tree_xset(&ctl_count, euid, count);
+	}
+
+	if (*count == CONTROL_MAXCONN_PER_CLIENT) {
+		close(connfd);
+		log_warnx("warn: too many connections to control socket "
+		    "from user with uid %lu", (unsigned long int)euid);
+		return;
+	}
+	(*count)++;
+
+	do {
+		++connid;
+	} while (tree_get(&ctl_conns, connid));
 
 	c = xcalloc(1, sizeof(*c), "control_accept");
-	if (getpeereid(connfd, &c->euid, &c->egid) == -1)
-		fatal("getpeereid");
-	c->id = ++connid;
+	c->euid = euid;
+	c->egid = egid;
+	c->id = connid;
 	c->mproc.proc = PROC_CLIENT;
 	c->mproc.handler = control_dispatch_ext;
 	c->mproc.data = c;
@@ -368,6 +378,14 @@ pause:
 static void
 control_close(struct ctl_conn *c)
 {
+	size_t	*count;
+
+	count = tree_xget(&ctl_count, c->euid);
+	(*count)--;
+	if (*count == 0) {
+		tree_xpop(&ctl_count, c->euid);
+		free(count);
+	}
 	tree_xpop(&ctl_conns, c->id);
 	mproc_clear(&c->mproc);
 	free(c);
@@ -454,7 +472,7 @@ control_dispatch_ext(struct mproc *p, struct imsg *imsg)
 
 	switch (imsg->hdr.type) {
 	case IMSG_CTL_SMTP_SESSION:
-		if (env->sc_flags & (SMTPD_SMTP_PAUSED | SMTPD_EXITING)) {
+		if (env->sc_flags & SMTPD_SMTP_PAUSED) {
 			m_compose(p, IMSG_CTL_FAIL, 0, 0, -1, NULL, 0);
 			return;
 		}
@@ -473,7 +491,7 @@ control_dispatch_ext(struct mproc *p, struct imsg *imsg)
 		if (c->euid)
 			goto badcred;
 		kvp = imsg->data;
-		if (! stat_backend->iter(&kvp->iter, &key, &val))
+		if (!stat_backend->iter(&kvp->iter, &key, &val))
 			kvp->iter = NULL;
 		else {
 			(void)strlcpy(kvp->key, key, sizeof kvp->key);
@@ -482,34 +500,17 @@ control_dispatch_ext(struct mproc *p, struct imsg *imsg)
 		m_compose(p, IMSG_CTL_GET_STATS, 0, 0, -1, kvp, sizeof *kvp);
 		return;
 
-	case IMSG_CTL_SHUTDOWN:
-		/* NEEDS_FIX */
-		log_debug("debug: received shutdown request");
-
-		if (c->euid)
-			goto badcred;
-
-		if (env->sc_flags & SMTPD_EXITING) {
-			m_compose(p, IMSG_CTL_FAIL, 0, 0, -1, NULL, 0);
-			return;
-		}
-		env->sc_flags |= SMTPD_EXITING;
-		m_compose(p, IMSG_CTL_OK, 0, 0, -1, NULL, 0);
-		m_compose(p_parent, IMSG_CTL_SHUTDOWN, 0, 0, -1, NULL, 0);
-		return;
-
 	case IMSG_CTL_VERBOSE:
 		if (c->euid)
 			goto badcred;
 
-		if (imsg->hdr.len - IMSG_HEADER_SIZE != sizeof(verbose))
+		if (imsg->hdr.len - IMSG_HEADER_SIZE != sizeof(v))
 			goto badcred;
 
 		memcpy(&v, imsg->data, sizeof(v));
-		verbose = v;
-		log_verbose(verbose);
+		log_trace_verbose(v);
 
-		control_broadcast_verbose(IMSG_CTL_VERBOSE, verbose);
+		control_broadcast_verbose(IMSG_CTL_VERBOSE, v);
 
 		m_compose(p, IMSG_CTL_OK, 0, 0, -1, NULL, 0);
 		return;
@@ -518,14 +519,14 @@ control_dispatch_ext(struct mproc *p, struct imsg *imsg)
 		if (c->euid)
 			goto badcred;
 
-		if (imsg->hdr.len - IMSG_HEADER_SIZE != sizeof(verbose))
+		if (imsg->hdr.len - IMSG_HEADER_SIZE != sizeof(v))
 			goto badcred;
 
 		memcpy(&v, imsg->data, sizeof(v));
-		verbose |= v;
-		log_verbose(verbose);
+		tracing |= v;
+		log_trace_verbose(tracing);
 
-		control_broadcast_verbose(IMSG_CTL_VERBOSE, verbose);
+		control_broadcast_verbose(IMSG_CTL_VERBOSE, tracing);
 
 		m_compose(p, IMSG_CTL_OK, 0, 0, -1, NULL, 0);
 		return;
@@ -534,14 +535,14 @@ control_dispatch_ext(struct mproc *p, struct imsg *imsg)
 		if (c->euid)
 			goto badcred;
 
-		if (imsg->hdr.len - IMSG_HEADER_SIZE != sizeof(verbose))
+		if (imsg->hdr.len - IMSG_HEADER_SIZE != sizeof(v))
 			goto badcred;
 
 		memcpy(&v, imsg->data, sizeof(v));
-		verbose &= ~v;
-		log_verbose(verbose);
+		tracing &= ~v;
+		log_trace_verbose(tracing);
 
-		control_broadcast_verbose(IMSG_CTL_VERBOSE, verbose);
+		control_broadcast_verbose(IMSG_CTL_VERBOSE, tracing);
 
 		m_compose(p, IMSG_CTL_OK, 0, 0, -1, NULL, 0);
 		return;
@@ -550,7 +551,7 @@ control_dispatch_ext(struct mproc *p, struct imsg *imsg)
 		if (c->euid)
 			goto badcred;
 
-		if (imsg->hdr.len - IMSG_HEADER_SIZE != sizeof(verbose))
+		if (imsg->hdr.len - IMSG_HEADER_SIZE != sizeof(v))
 			goto badcred;
 
 		memcpy(&v, imsg->data, sizeof(v));
@@ -565,7 +566,7 @@ control_dispatch_ext(struct mproc *p, struct imsg *imsg)
 		if (c->euid)
 			goto badcred;
 
-		if (imsg->hdr.len - IMSG_HEADER_SIZE != sizeof(verbose))
+		if (imsg->hdr.len - IMSG_HEADER_SIZE != sizeof(v))
 			goto badcred;
 
 		memcpy(&v, imsg->data, sizeof(v));
@@ -638,7 +639,7 @@ control_dispatch_ext(struct mproc *p, struct imsg *imsg)
 		if (c->euid)
 			goto badcred;
 
-		if (! (env->sc_flags & SMTPD_MDA_PAUSED)) {
+		if (!(env->sc_flags & SMTPD_MDA_PAUSED)) {
 			m_compose(p, IMSG_CTL_FAIL, 0, 0, -1, NULL, 0);
 			return;
 		}

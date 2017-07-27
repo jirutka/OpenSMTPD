@@ -1,4 +1,4 @@
-/*	$OpenBSD: to.c,v 1.17 2014/04/19 14:27:29 gilles Exp $	*/
+/*	$OpenBSD: to.c,v 1.28 2016/05/30 12:33:44 mpi Exp $	*/
 
 /*
  * Copyright (c) 2009 Jacek Masiulaniec <jacekm@dobremiasto.net>
@@ -33,7 +33,6 @@
 #include <errno.h>
 #include <event.h>
 #include <fcntl.h>
-#include <fts.h>
 #include <imsg.h>
 #include <limits.h>
 #include <inttypes.h>
@@ -128,7 +127,7 @@ text_to_mailaddr(struct mailaddr *maddr, const char *email)
 		if (strlcpy(maddr->domain, hostname, sizeof maddr->domain)
 		    >= sizeof maddr->domain)
 			return 0;
-	}	
+	}
 
 	return 1;
 }
@@ -195,21 +194,26 @@ time_to_text(time_t when)
 	char *day[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
 	char *month[] = {"Jan","Feb","Mar","Apr","May","Jun",
 			 "Jul","Aug","Sep","Oct","Nov","Dec"};
+	char *tz;
+	long offset;
 
 	lt = localtime(&when);
 	if (lt == NULL || when == 0)
 		fatalx("time_to_text: localtime");
 
+	offset = lt->tm_gmtoff;
+	tz = lt->tm_zone;
+
 	/* We do not use strftime because it is subject to locale substitution*/
-	if (! bsnprintf(buf, sizeof(buf),
+	if (!bsnprintf(buf, sizeof(buf),
 	    "%s, %d %s %d %02d:%02d:%02d %c%02d%02d (%s)",
 	    day[lt->tm_wday], lt->tm_mday, month[lt->tm_mon],
 	    lt->tm_year + 1900,
 	    lt->tm_hour, lt->tm_min, lt->tm_sec,
-	    lt->tm_gmtoff >= 0 ? '+' : '-',
-	    abs((int)lt->tm_gmtoff / 3600),
-	    abs((int)lt->tm_gmtoff % 3600) / 60,
-	    lt->tm_zone))
+	    offset >= 0 ? '+' : '-',
+	    abs((int)offset / 3600),
+	    abs((int)offset % 3600) / 60,
+	    tz))
 		fatalx("time_to_text: bsnprintf");
 
 	return buf;
@@ -275,42 +279,20 @@ text_to_netaddr(struct netaddr *netaddr, const char *s)
 	if (strncasecmp("IPv6:", s, 5) == 0)
 		s += 5;
 
-	if (strchr(s, '/') != NULL) {
-		/* dealing with netmask */
-		bits = inet_net_pton(AF_INET, s, &ssin.sin_addr,
-		    sizeof(struct in_addr));
-		if (bits != -1) {
-			ssin.sin_family = AF_INET;
-			memcpy(&ss, &ssin, sizeof(ssin));
-			ss.ss_len = sizeof(struct sockaddr_in);
-		}
-		else {
-			bits = inet_net_pton(AF_INET6, s, &ssin6.sin6_addr,
-			    sizeof(struct in6_addr));
-			if (bits == -1) {
-				log_warn("warn: inet_net_pton");
-				return 0;
-			}
-			ssin6.sin6_family = AF_INET6;
-			memcpy(&ss, &ssin6, sizeof(ssin6));
-			ss.ss_len = sizeof(struct sockaddr_in6);
-		}
-	}
-	else {
-		/* IP address ? */
-		if (inet_pton(AF_INET, s, &ssin.sin_addr) == 1) {
-			ssin.sin_family = AF_INET;
-			bits = 32;
-			memcpy(&ss, &ssin, sizeof(ssin));
-			ss.ss_len = sizeof(struct sockaddr_in);
-		}
-		else if (inet_pton(AF_INET6, s, &ssin6.sin6_addr) == 1) {
-			ssin6.sin6_family = AF_INET6;
-			bits = 128;
-			memcpy(&ss, &ssin6, sizeof(ssin6));
-			ss.ss_len = sizeof(struct sockaddr_in6);
-		}
-		else return 0;
+	bits = inet_net_pton(AF_INET, s, &ssin.sin_addr,
+	    sizeof(struct in_addr));
+	if (bits != -1) {
+		ssin.sin_family = AF_INET;
+		memcpy(&ss, &ssin, sizeof(ssin));
+		ss.ss_len = sizeof(struct sockaddr_in);
+	} else {
+		bits = inet_net_pton(AF_INET6, s, &ssin6.sin6_addr,
+		    sizeof(struct in6_addr));
+		if (bits == -1)
+			return 0;
+		ssin6.sin6_family = AF_INET6;
+		memcpy(&ss, &ssin6, sizeof(ssin6));
+		ss.ss_len = sizeof(struct sockaddr_in6);
 	}
 
 	netaddr->ss   = ss;
@@ -344,9 +326,9 @@ text_to_relayhost(struct relayhost *relay, const char *s)
 	const char     *errstr = NULL;
 	char	       *p, *q;
 	char		buffer[1024];
-	char	       *sep;
+	char	       *beg, *end;
 	size_t		i;
-	int		len;
+	size_t		len;
 
 	memset(buffer, 0, sizeof buffer);
 	if (strlcpy(buffer, s, sizeof buffer) >= sizeof buffer)
@@ -375,40 +357,53 @@ text_to_relayhost(struct relayhost *relay, const char *s)
 	if (relay->flags & F_LMTP)
 		relay->port = 0;
 
-	if ((sep = strrchr(p, ':')) != NULL) {
-		*sep = 0;
-		relay->port = strtonum(sep+1, 1, 0xffff, &errstr);
-		if (errstr)
-			return 0;
-		len = sep - p;
-	}
-	else
-		len = strlen(p);
-
-	if ((relay->flags & F_LMTP) && (relay->port == 0))
-		return 0;
-
-	relay->hostname[len] = 0;
-
-	q = strchr(p, '@');
-	if (q == NULL && relay->flags & F_AUTH)
-		return 0;
-	if (q && !(relay->flags & F_AUTH))
-		return 0;
-
-	if (q == NULL) {
-		if (strlcpy(relay->hostname, p, sizeof (relay->hostname))
-		    >= sizeof (relay->hostname))
-			return 0;
-	} else {
+	/* first, we extract the label if any */
+	if ((q = strchr(p, '@')) != NULL) {
 		*q = 0;
 		if (strlcpy(relay->authlabel, p, sizeof (relay->authlabel))
 		    >= sizeof (relay->authlabel))
 			return 0;
-		if (strlcpy(relay->hostname, q + 1, sizeof (relay->hostname))
-		    >= sizeof (relay->hostname))
+		p = q + 1;
+	}
+
+	/* then, we extract the mail exchanger */
+	beg = end = p;
+	if (*beg == '[') {
+		if ((end = strchr(beg, ']')) == NULL)
+			return 0;
+		/* skip ']', it has to be included in the relay hostname */
+		++end;
+		len = end - beg;
+	}
+	else {
+		for (end = beg; *end; ++end)
+			if (!isalnum((unsigned char)*end) &&
+			    *end != '_' && *end != '.' && *end != '-')
+				break;
+		len = end - beg;
+	}
+	if (len >= sizeof relay->hostname)
+		return 0;
+	for (i = 0; i < len; ++i)
+		relay->hostname[i] = beg[i];
+	relay->hostname[i] = 0;
+
+	/* finally, we extract the port */
+	p = beg + len;
+	if (*p == ':') {
+		relay->port = strtonum(p+1, 1, 0xffff, &errstr);
+		if (errstr)
 			return 0;
 	}
+
+	if (!valid_domainpart(relay->hostname))
+		return 0;
+	if ((relay->flags & F_LMTP) && (relay->port == 0))
+		return 0;
+	if (relay->authlabel[0] == '\0' && relay->flags & F_AUTH)
+		return 0;
+	if (relay->authlabel[0] != '\0' && !(relay->flags & F_AUTH))
+		return 0;
 	return 1;
 }
 
@@ -585,7 +580,7 @@ rule_to_text(struct rule *r)
 	case A_NONE:
 		break;
 	}
-	    
+
 	return buf;
 }
 
@@ -845,7 +840,7 @@ alias_is_include(struct expandnode *alias, const char *line, size_t len)
 	else
 		return 0;
 
-	if (! alias_is_filename(alias, line + skip, len - skip))
+	if (!alias_is_filename(alias, line + skip, len - skip))
 		return 0;
 
 	alias->type = EXPAND_INCLUDE;

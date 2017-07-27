@@ -1,68 +1,59 @@
-#	$OpenBSD$
+#	$OpenBSD: Makefile,v 1.87 2017/05/26 21:30:00 gilles Exp $
 
-ASRDIR=		${.CURDIR}/../asr
-.PATH:		${.CURDIR}/.. ${ASRDIR}
-
-NEED_ASR!=		grep -q AI_ADDRCONF /usr/include/netdb.h && echo No || echo Yes
-NEED_REALLOCARRAY!=	grep -q reallocarray /usr/include/stdlib.h && echo No || echo Yes
-OPENBSD_VERSION!=	uname -r
+.PATH:		${.CURDIR}/..
 
 PROG=		smtpd
 
-SRCS=		aliases.c
-SRCS+=		bounce.c
-SRCS+=		ca.c
-SRCS+=		compress_backend.c
-SRCS+=		config.c
-SRCS+=		control.c
-SRCS+=		crypto.c
-SRCS+=		delivery.c
-SRCS+=		dict.c
-SRCS+=		dns.c
-SRCS+=		envelope.c
-SRCS+=		esc.c
-SRCS+=		expand.c
-SRCS+=		filter.c
-SRCS+=		forward.c
-SRCS+=		iobuf.c
-SRCS+=		ioev.c
-.if ${OPENBSD_VERSION} != "5.7"
-SRCS+=		libressl.c
-.endif
-SRCS+=		limit.c
-SRCS+=		lka.c
-SRCS+=		lka_session.c
-SRCS+=		log.c
-SRCS+=		mailaddr.c
-SRCS+=		mda.c
-SRCS+=		mproc.c
-SRCS+=		mta.c
-SRCS+=		mta_session.c
-SRCS+=		parse.y
-SRCS+=		pony.c
-SRCS+=		queue.c
-SRCS+=		queue_backend.c
-.if ${NEED_REALLOCARRAY} == "Yes"
-CFLAGS+=	-DNEED_REALLOCARRAY
-SRCS+=		reallocarray.c
-.endif
-SRCS+=		rfc2822.c
-SRCS+=		ruleset.c
-SRCS+=		runq.c
-SRCS+=		scheduler.c
-SRCS+=		scheduler_backend.c
-SRCS+=		smtp.c
-SRCS+=		smtp_session.c
-SRCS+=		smtpd.c
-SRCS+=		ssl.c
-SRCS+=		ssl_smtpd.c
-SRCS+=		stat_backend.c
-SRCS+=		table.c
-SRCS+=		to.c
-SRCS+=		tree.c
-SRCS+=		util.c
-SRCS+=		waitq.c
+SRCS=	aliases.c
+SRCS+=	bounce.c
+SRCS+=	ca.c
+SRCS+=	compress_backend.c
+SRCS+=	config.c
+SRCS+=	control.c
+SRCS+=	crypto.c
+SRCS+=	delivery.c
+SRCS+=	dict.c
+SRCS+=	dns.c
+SRCS+=	envelope.c
+SRCS+=	esc.c
+SRCS+=	expand.c
+SRCS+=	filter.c
+SRCS+=	forward.c
+SRCS+=	iobuf.c
+SRCS+=	ioev.c
+SRCS+=	limit.c
+SRCS+=	lka.c
+SRCS+=	lka_session.c
+SRCS+=	log.c
+SRCS+=	mailaddr.c
+SRCS+=	mda.c
+SRCS+=	mda_variables.c
+SRCS+=	mproc.c
+SRCS+=	mta.c
+SRCS+=	mta_session.c
+SRCS+=	parse.y
+SRCS+=	pony.c
+SRCS+=	queue.c
+SRCS+=	queue_backend.c
+SRCS+=	ruleset.c
+SRCS+=	runq.c
+SRCS+=	scheduler.c
+SRCS+=	scheduler_backend.c
+SRCS+=	smtp.c
+SRCS+=	smtp_session.c
+SRCS+=	smtpf_session.c
+SRCS+=	smtpd.c
+SRCS+=	ssl.c
+SRCS+=	ssl_smtpd.c
+SRCS+=	stat_backend.c
+SRCS+=	table.c
+SRCS+=	to.c
+SRCS+=	tree.c
+SRCS+=	util.c
+SRCS+=	waitq.c
 
+# RFC parsers
+SRCS+=		rfc2822.c
 
 # backends
 SRCS+=		compress_gzip.c
@@ -82,49 +73,26 @@ SRCS+=		queue_fs.c
 SRCS+=		queue_null.c
 SRCS+=		queue_proc.c
 SRCS+=		queue_ram.c
+
 SRCS+=		scheduler_ramqueue.c
 SRCS+=		scheduler_null.c
 SRCS+=		scheduler_proc.c
 
 SRCS+=		stat_ramstat.c
 
-.if ${NEED_ASR} == "Yes"
-CFLAGS+=	-I${ASRDIR}
-SRCS+=	asr.c
-SRCS+=	asr_debug.c
-SRCS+=	asr_private.h
-SRCS+=	asr_utils.c
-SRCS+=	getaddrinfo.c
-SRCS+=	getaddrinfo_async.c
-SRCS+=	gethostnamadr.c
-SRCS+=	gethostnamadr_async.c
-SRCS+=	getnameinfo.c
-SRCS+=	getnameinfo_async.c
-SRCS+=	getnetnamadr.c
-SRCS+=	getnetnamadr_async.c
-SRCS+=	getrrsetbyname.c
-SRCS+=	getrrsetbyname_async.c
-SRCS+=	res_debug.c
-SRCS+=	res_init.c
-SRCS+=	res_mkquery.c
-SRCS+=	res_query.c
-SRCS+=	res_search_async.c
-SRCS+=	res_send.c
-SRCS+=	res_send_async.c
-SRCS+=	sethostent.c
-SRCS+=	event_asr_run.c
-.endif
-
-MAN=		smtpd.8 smtpd.conf.5 table.5
+MAN=		sendmail.8 smtpd.8 smtpd.conf.5 table.5
 BINDIR=		/usr/sbin
 
 LDADD+=		-levent -lutil -lssl -lcrypto -lm -lz
 DPADD+=		${LIBEVENT} ${LIBUTIL} ${LIBSSL} ${LIBCRYPTO} ${LIBM} ${LIBZ}
-CFLAGS+=	-g3 -ggdb -I${.CURDIR}/..
+
+CFLAGS+=	-fstack-protector-all
+CFLAGS+=	-I${.CURDIR}/..
 CFLAGS+=	-Wall -Wstrict-prototypes -Wmissing-prototypes
 CFLAGS+=	-Wmissing-declarations
 CFLAGS+=	-Wshadow -Wpointer-arith -Wcast-qual
-CFLAGS+=	-Wsign-compare -Wbounded
+CFLAGS+=	-Wsign-compare
+CFLAGS+=	-Werror-implicit-function-declaration
 #CFLAGS+=	-Werror # during development phase (breaks some archs)
 CFLAGS+=	-DIO_SSL
 CFLAGS+=	-DQUEUE_PROFILING
