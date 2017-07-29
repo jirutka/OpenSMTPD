@@ -1,0 +1,64 @@
+dist: trusty
+sudo: true
+language: c
+
+jobs:
+  include:
+    # Build and test on Ubuntu Trusty.
+    - stage: test
+      compiler: gcc
+      before_install:
+        - "wget https://www.opensmtpd.org/archives/libasr-1.0.2.tar.gz \
+              && echo 'be48f048b93c243fefadbafbf002db2e00e1e1fa  libasr-1.0.2.tar.gz' | sha1sum -c || exit 1"
+        - "wget https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-2.5.5.tar.gz \
+              && echo '36511c98fe450bbb50da8c8a3d4eba2cc7d0f83c  libressl-2.5.5.tar.gz' | sha1sum -c || exit 1"
+        - tar -xzf libasr-*.tar.gz
+        - tar -xzf libressl-*.tar.gz
+      install:
+        - ( cd libressl-* && ./configure && make )
+        - sudo make -C libressl-* install
+        - ( cd libasr-* && ./configure && make )
+        - sudo make -C libasr-1.0.2 install
+      before_script:
+        - ./bootstrap
+      script:
+        - set -e
+        - ./configure
+        - make
+        - make check
+
+    # Build and test on Alpine Linux inside chroot, i.e. on system with musl libc.
+    - &test-alpine
+      stage: test
+      language: minimal
+      before_install:
+        - "wget 'https://raw.githubusercontent.com/alpinelinux/alpine-chroot-install/v0.6.0/alpine-chroot-install' \
+              && echo 'a827a4ba3d0817e7c88bae17fe34e50204983d1e  alpine-chroot-install' | sha1sum -c || exit 1"
+        - alpine() { /alpine/enter-chroot -u "$USER" "$@"; }
+      install:
+        - sudo sh alpine-chroot-install -a "$ARCH"
+              -p 'build-base autoconf automake libtool mdocml db-dev libasr-dev libevent-dev fts-dev zlib-dev libressl-dev bison flex-dev'
+      before_script:
+        - alpine ./bootstrap
+      script:
+        - set -e
+        - alpine ./configure
+              --with-libs="-lfts"
+              --with-path-CAfile=/etc/ssl/certs/ca-certificates.crt
+              --with-pie
+              --with-table-db
+        - alpine make
+        - alpine make check
+      env: ARCH=x86_64
+
+#    - <<: *test-alpine
+#      env: ARCH=x86
+#
+#    - <<: *test-alpine
+#      env: ARCH=aarch64
+#
+#    - <<: *test-alpine
+#      env: ARCH=armhf
+#
+#    - <<: *test-alpine
+#      env: ARCH=ppc64le
